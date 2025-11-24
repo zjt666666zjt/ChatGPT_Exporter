@@ -1,12 +1,25 @@
 // ==UserScript==
-// @name        ChatGPT Universal Exporter Enhanced (Modern UI + Progress Button + Project Toggle)
-// @description 导出 ChatGPT 对话为 ZIP（JSON/Markdown/HTML），支持“最近 N 条”（只作用根目录），可选导出全部项目文件（Gizmos），按钮内嵌进度条与动态状态。
-// @match       https://chatgpt.com/*
-// @match       https://chat.openai.com/*
-// @require     https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
-// @grant       none
-// @license     MIT
-// @run-at      document-start
+// @name         ChatGPT Universal Exporter Enhanced Beta
+// @name:zh-CN   ChatGPT 通用导出增强版（现代UI + 进度按钮 + 项目导出开关）
+//
+// @description  Export ChatGPT conversations as ZIP (JSON/Markdown/HTML). Supports "latest N items" (root only),
+// @description  optional export of all project (Gizmos) conversations, and a floating button with built-in progress bar.
+// @description:zh-CN 导出 ChatGPT 对话为 ZIP（JSON/Markdown/HTML）。支持“最近 N 条”（仅作用根目录），可选导出全部项目（Gizmos）会话，悬浮按钮内嵌进度条与动态状态。
+//
+// @namespace    https://chatgpt.com/
+// @version      2.0.0
+// @author       ChatGPT Universal Exporter Enhanced
+//
+// @match        https://chatgpt.com/*
+// @match        https://chat.openai.com/*
+//
+// @icon         https://chatgpt.com/favicon.ico
+// @noframes
+//
+// @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
+// @grant        none
+// @license      MIT
+// @run-at       document-start
 // ==/UserScript==
 
 (function () {
@@ -379,8 +392,8 @@
     // 5. API 辅助：项目列表 / 会话 meta / 会话详情
     // ==========================================
 
+    // ✅ 修复：不再要求 workspaceId 才能请求项目
     async function getProjects(workspaceId) {
-        if (!workspaceId) return [];
         const r = await fetchWithRetry('/backend-api/gizmos/snorlax/sidebar', {
             headers: buildHeaders(workspaceId)
         });
@@ -399,11 +412,10 @@
      * 收集会话 meta 信息（ID + 更新时间 + source）
      * 返回 { rootMeta, projectMeta }
      *
-     * - 根目录：active + archived
-     * - 项目：所有项目内会话（如 includeProjects 为 true）
-     * - 若同一个 ID 同时出现在根目录和项目，以项目为准（只导出一次，算作项目会话）
+     * rootLimit：只作用于“根目录”，达到 N 条就提前停止继续扫描根目录历史；
+     * 项目部分无数量限制（如果 includeProjects）。
      */
-    async function collectConversationsMeta(workspaceId, includeProjects) {
+    async function collectConversationsMeta(workspaceId, includeProjects, rootLimit = Infinity) {
         const headers = buildHeaders(workspaceId);
         const metaMap = new Map(); // id -> meta
 
@@ -412,30 +424,45 @@
             if (!existing) {
                 metaMap.set(meta.id, meta);
             } else {
-                // project 信息优先级更高：如果后面发现该会话在项目内，则归为 project
+                // project 信息优先级更高：如果 later 发现该会话在项目内，则归为 project
                 if (meta.source === 'project' && existing.source !== 'project') {
                     metaMap.set(meta.id, { ...existing, ...meta });
                 }
             }
         };
 
+        const rootLimitEff =
+            Number.isFinite(rootLimit) && rootLimit > 0 ? rootLimit : Infinity;
+        let rootCount = 0;
+        let stopRootScan = false;
+
         // 1) 根目录会话：Active + Archived
         for (const is_archived of [false, true]) {
+            if (stopRootScan) break;
+
             let offset = 0;
             let has_more = true;
+
             while (has_more) {
+                if (rootCount >= rootLimitEff && rootLimitEff !== Infinity) {
+                    stopRootScan = true;
+                    break;
+                }
+
                 const url = `/backend-api/conversations?offset=${offset}&limit=${PAGE_LIMIT}&order=updated${
                     is_archived ? '&is_archived=true' : ''
                 }`;
                 const r = await fetchWithRetry(url, { headers });
                 if (!r.ok)
                     throw new Error(`列举项目外对话列表失败 (${r.status})`);
+
                 const j = await r.json();
                 const items = j.items || [];
                 if (!items.length) {
                     has_more = false;
                     break;
                 }
+
                 for (const it of items) {
                     if (!it || !it.id) continue;
                     const updated =
@@ -451,15 +478,23 @@
                         source: 'root',
                         isArchived: !!is_archived
                     });
+                    rootCount++;
+                    if (rootCount >= rootLimitEff && rootLimitEff !== Infinity) {
+                        stopRootScan = true;
+                        break;
+                    }
                 }
+
+                if (stopRootScan) break;
+
                 has_more = items.length === PAGE_LIMIT;
                 offset += items.length;
                 await sleep(jitter());
             }
         }
 
-        // 2) 项目内会话（仅当 includeProjects && workspaceId 时扫描）
-        if (includeProjects && workspaceId) {
+        // 2) 项目内会话（✅ 修复：只判断 includeProjects，不再要求 workspaceId）
+        if (includeProjects) {
             const projects = await getProjects(workspaceId);
             for (const project of projects) {
                 let cursor = '0';
@@ -595,12 +630,17 @@
                 return;
             }
 
-            // 扫描 meta
+            // 扫描 meta（根目录带上 rootLimit）
             setIcon('spinner');
             setLabel('扫描中...');
             setProgress(5);
 
-            const { rootMeta, projectMeta } = await collectConversationsMeta(workspaceId, includeProjects);
+            const { rootMeta, projectMeta } = await collectConversationsMeta(
+                workspaceId,
+                includeProjects,
+                limit
+            );
+
             if (!rootMeta.length && !projectMeta.length) {
                 alert('未找到任何会话记录。');
                 setIcon('error');
@@ -609,12 +649,13 @@
                 return;
             }
 
-            // 各自排序
+            // 各自排序（按更新时间降序）
             rootMeta.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
             projectMeta.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 
             // 根目录应用“最近 N 条”限制；项目不受 N 限制（全量导出）
-            const selectedRoot = limit === Infinity ? rootMeta : rootMeta.slice(0, limit);
+            const selectedRoot =
+                limit === Infinity ? rootMeta : rootMeta.slice(0, limit);
             const exportMetaList = selectedRoot.concat(projectMeta);
             const total = exportMetaList.length;
 
@@ -729,7 +770,7 @@
                 --ue-radius: 12px;
                 --ue-overlay-bg: rgba(52, 53, 65, 0.7);
             }
-
+            
             #gpt-rescue-btn {
                 --prog: 0%;
                 position: fixed; bottom: 24px; right: 24px; z-index: 99997;
@@ -854,12 +895,12 @@
                     <h2>导出对话记录</h2>
                     <button class="ue-close">✕</button>
                 </div>
-
+                
                 <div class="ue-tabs">
                     <div class="ue-tab active" data-mode="personal">👤 个人空间</div>
                     <div class="ue-tab" data-mode="team">🏢 团队空间</div>
                 </div>
-
+                
                 <div style="font-size:13px; color:#666; margin-bottom:6px;">导出范围:</div>
                 <div class="ue-range-wrapper">
                     <div class="ue-range-selector">
@@ -901,7 +942,7 @@
                     <input type="text" id="team-id" class="ue-input" placeholder="输入 Team Workspace ID (ws-...)">
                     <div class="ue-hint">自动检测: ${detectedText}</div>
                 </div>
-
+                
                 <div class="ue-footer">
                     <button id="dlg-cancel" class="ue-btn ue-btn-cancel">取消</button>
                     <button id="dlg-start" class="ue-btn ue-btn-primary">开始导出</button>
