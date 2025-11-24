@@ -57,12 +57,12 @@
 适合：想体验新功能 / 新 UI，对偶发小问题可以接受的用户。  
 
 👉 一键安装链接：  
-👉 **[点此一键安装 Beta 测试版脚本](https://github.com/zjt666666zjt/ChatGPT_Exporter/raw/main/chatgpt-exporter.user_beta.js)**
+👉 **[点此一键安装 Beta 测试版脚本](https://github.com/zjt666666zjt/ChatGPT_Exporter/raw/main/chatgpt-exporter.user-beta.js)**
 
 或手动安装：
 
 1. 打开仓库中的  
-   [`chatgpt-exporter.user_beta.js`](https://github.com/zjt666666zjt/ChatGPT_Exporter/blob/main/chatgpt-exporter.user_beta.js)  
+   [`chatgpt-exporter.user_beta.js`](https://github.com/zjt666666zjt/ChatGPT_Exporter/blob/main/chatgpt-exporter.user-beta.js)  
 2. 点击页面右上角的「Raw」或「原始文件」按钮  
 3. 浏览器会自动触发 Tampermonkey 安装提示 → 点击「安装」即可  
 
