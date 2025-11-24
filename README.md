@@ -57,7 +57,7 @@
 适合：想体验新功能 / 新 UI，对偶发小问题可以接受的用户。  
 
 👉 一键安装链接：  
-**[点此一键安装 Beta 测试版脚本](https://raw.githubusercontent.com/zjt666666zjt/ChatGPT_Exporter/main/chatgpt-exporter.user_beta.js)**  
+👉 **[点此一键安装 Beta 测试版脚本](https://github.com/zjt666666zjt/ChatGPT_Exporter/raw/main/chatgpt-exporter.user_beta.js)**
 
 或手动安装：
 
