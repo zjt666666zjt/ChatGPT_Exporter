@@ -331,12 +331,27 @@
     }
 
     // --- 导出流程 Export process ---
-    async function startExportProcess(mode, workspaceId, formats) {
+    async function startExportProcess(mode, workspaceId, formats, singleConvId) {
         const btn = document.getElementById('gpt-rescue-btn');
         btn.disabled = true;
         if (!await ensureAccessToken()) { btn.disabled = false; btn.textContent = 'Export Conversations'; return; }
         try {
             const zip = new JSZip();
+            // Single-conversation export path (with workspace auto-fallback)
+            if (singleConvId) {
+                try { btn.textContent = '📥 Fetching conversation…'; } catch(_){}
+                const convData = await getConversationAny(singleConvId, workspaceId);
+                if (formats.json) zip.file(generateUniqueFilename(convData, 'json'), JSON.stringify(convData, null, 2));
+                if (formats.markdown) zip.file(generateUniqueFilename(convData, 'md'), convertToMarkdown(convData));
+                if (formats.html) zip.file(generateUniqueFilename(convData, 'html'), convertToHTML(convData));
+                try { btn.textContent = '📦 Generating ZIP…'; } catch(_){}
+                const blobSingle = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
+                const dateSingle = new Date().toISOString().slice(0, 10);
+                const filenameSingle = (mode === 'team' ? `chatgpt_team_single_${workspaceId}_` : 'chatgpt_personal_single_') + `${dateSingle}.zip`;
+                downloadFile(blobSingle, filenameSingle);
+                try { alert('✅ 导出完成'); btn.textContent = '✅ 完成'; } catch(_){}
+                return;
+            }
             btn.textContent = '📂 获取项目外对话…';
             const orphanIds = await collectIds(btn, workspaceId, null);
             for (let i = 0; i < orphanIds.length; i++) {
@@ -432,6 +447,29 @@
         return j;
     }
 
+    async function getConversationAny(id, preferredWorkspaceId) {
+        const tried = new Set();
+        const order = [];
+        if (preferredWorkspaceId) order.push(preferredWorkspaceId);
+        const wsFromUrl = detectWorkspaceIdFromUrl();
+        if (wsFromUrl && !order.includes(wsFromUrl)) order.push(wsFromUrl);
+        const detected = detectAllWorkspaceIds();
+        detected.forEach(ws => { if (!order.includes(ws)) order.push(ws); });
+        order.push(null);
+        let lastErr = null;
+        for (const ws of order) {
+            const key = ws || 'personal';
+            if (tried.has(key)) continue;
+            tried.add(key);
+            try {
+                return await getConversation(id, ws || undefined);
+            } catch (e) {
+                lastErr = e;
+            }
+        }
+        throw lastErr || new Error('无法获取对话详情');
+    }
+
     // --- 工作空间自动检测 Workspace detection ---
     function detectAllWorkspaceIds() {
         const foundIds = new Set(capturedWorkspaceIds);
@@ -457,6 +495,21 @@
         } catch(e) {}
         try { console.log('🔍 检测到以下 Workspace IDs:', Array.from(foundIds)); } catch(_){}
         return Array.from(foundIds);
+    }
+
+    // Helper: detect conversation ID (UUID) from current URL path
+    function detectConversationIdFromUrl() {
+        try {
+            const m = location.pathname.match(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/i);
+            return m ? m[0] : null;
+        } catch (_) { return null; }
+    }
+
+    function detectWorkspaceIdFromUrl() {
+        try {
+            const m = location.pathname.match(/ws-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/i);
+            return m ? m[0] : null;
+        } catch (_) { return null; }
     }
 
     // --- 对话框UI函数 Simple export dialog ---
@@ -492,10 +545,31 @@
         const radioTeam = dialog.querySelector('input[name="mode"][value="team"]');
         const teamArea = dialog.querySelector('#team-area');
         const detectedDiv = dialog.querySelector('#detected');
+        // Insert scope controls (all/single)
+        const scopeDiv = document.createElement('div');
+        scopeDiv.style.margin = '10px 0';
+        scopeDiv.innerHTML = '<div style="font-weight:600;margin-bottom:6px;">范围</div>' +
+            '<label><input type="radio" name="scope" value="all" checked> 全部会话</label>' +
+            '<label style="margin-left:12px;"><input type="radio" name="scope" value="single"> 仅单个会话</label>';
+        dialog.insertBefore(scopeDiv, teamArea);
+        const singleArea = document.createElement('div');
+        singleArea.id = 'single-area';
+        singleArea.style.display = 'none';
+        singleArea.style.marginTop = '8px';
+        singleArea.innerHTML = '<div style="font-size:12px;color:#555;margin-bottom:6px;">会话ID（UUID）。若当前在会话页面将自动填充。</div>' +
+            '<input type="text" id="conv-id" placeholder="例如：xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;">';
+        const actionRow = dialog.querySelector('#dlg-cancel')?.parentElement || teamArea.nextSibling;
+        dialog.insertBefore(singleArea, actionRow);
         radioTeam.addEventListener('change', () => teamArea.style.display = 'block');
         radioPersonal.addEventListener('change', () => teamArea.style.display = 'none');
+        const radioAll = scopeDiv.querySelector('input[name="scope"][value="all"]');
+        const radioSingle = scopeDiv.querySelector('input[name="scope"][value="single"]');
+        radioSingle.addEventListener('change', () => singleArea.style.display = 'block');
+        radioAll.addEventListener('change', () => singleArea.style.display = 'none');
         const ids = detectAllWorkspaceIds();
         if (ids.length) { detectedDiv.textContent = ids.join(' , '); }
+        const autoConv = detectConversationIdFromUrl();
+        if (autoConv) { const input = dialog.querySelector('#conv-id'); if (input) input.value = autoConv; }
         dialog.querySelector('#dlg-cancel').onclick = () => document.body.removeChild(overlay);
         dialog.querySelector('#dlg-start').onclick = async () => {
             const formats = { json: dialog.querySelector('#fmt-json').checked, markdown: dialog.querySelector('#fmt-md').checked, html: dialog.querySelector('#fmt-html').checked };
@@ -510,6 +584,27 @@
             document.body.removeChild(overlay);
             exportFormats.mode = mode; exportFormats.workspaceId = workspaceId;
             startExportProcess(mode, workspaceId, formats);
+        };
+        // Override: support single-conversation export
+        dialog.querySelector('#dlg-start').onclick = async () => {
+            const formats = { json: dialog.querySelector('#fmt-json').checked, markdown: dialog.querySelector('#fmt-md').checked, html: dialog.querySelector('#fmt-html').checked };
+            if (!formats.json && !formats.markdown && !formats.html) { alert('请至少选择一种导出格式'); return; }
+            const mode = radioTeam.checked ? 'team' : 'personal';
+            let workspaceId = null;
+            if (mode === 'team') {
+                const manual = dialog.querySelector('#team-id').value.trim();
+                workspaceId = manual || ids[0] || '';
+                if (!workspaceId) { alert('请选择或输入一个有效的 Team Workspace ID'); return; }
+            }
+            const scope = (document.querySelector('input[name="scope"]:checked')?.value) || 'all';
+            let conversationId = null;
+            if (scope === 'single') {
+                conversationId = (dialog.querySelector('#conv-id').value || '').trim();
+                if (!conversationId) { alert('请输入有效的会话 ID'); return; }
+            }
+            document.body.removeChild(overlay);
+            exportFormats.mode = mode; exportFormats.workspaceId = workspaceId;
+            startExportProcess(mode, workspaceId, formats, conversationId || null);
         };
         overlay.onclick = (e) => { if (e.target === overlay) document.body.removeChild(overlay); };
     }
