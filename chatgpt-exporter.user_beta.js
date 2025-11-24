@@ -2,10 +2,13 @@
 // @name         ChatGPT Universal Exporter Enhanced Beta
 // @name:zh-CN   ChatGPT 通用导出增强版（现代UI + 进度按钮 + 项目导出开关）
 //
+// @downloadURL  https://github.com/zjt666666zjt/ChatGPT_Exporter/raw/main/chatgpt-exporter.user_beta.js
+// @updateURL    https://github.com/zjt666666zjt/ChatGPT_Exporter/raw/main/chatgpt-exporter.user_beta.js
+//
 // @description  Export ChatGPT conversations as ZIP (JSON/Markdown/HTML). Supports "latest N items" (root only),
 // @description  optional export of all project (Gizmos) conversations, and a floating button with built-in progress bar.
 // @description:zh-CN 导出 ChatGPT 对话为 ZIP（JSON/Markdown/HTML）。支持“最近 N 条”（仅作用根目录），可选导出全部项目（Gizmos）会话，悬浮按钮内嵌进度条与动态状态。
-//
+
 // @namespace    https://chatgpt.com/
 // @version      2.0.0
 // @author       ChatGPT Universal Exporter Enhanced
