@@ -18,13 +18,27 @@
     const PAGE_LIMIT = 100;
     let accessToken = null;
     let capturedWorkspaceIds = new Set();
+    let stopNetworkIntercept = () => {};
+    let interceptStopped = false;
 
     // 导出格式配置 Export formats
     let exportFormats = { json: true, markdown: true, html: true };
 
+    // 安全恢复拦截，防止长期劫持 fetch 影响正常聊天
+    function maybeStopIntercept() {
+        if (interceptStopped) return;
+        interceptStopped = true;
+        try { stopNetworkIntercept(); } catch (_) {}
+    }
+
     // --- 网络拦截与信息捕获 Network intercept (minimal & safe) ---
     (function interceptNetwork() {
         const rawFetch = window.fetch;
+        const rawOpen = XMLHttpRequest.prototype.open;
+        stopNetworkIntercept = () => {
+            window.fetch = rawFetch;
+            XMLHttpRequest.prototype.open = rawOpen;
+        };
         function isSameOriginResource(res) {
             try {
                 const url = typeof res === 'string' ? new URL(res, location.href) : new URL(res.url, location.href);
@@ -67,7 +81,6 @@
             return rawFetch.apply(this, arguments);
         };
 
-        const rawOpen = XMLHttpRequest.prototype.open;
         XMLHttpRequest.prototype.open = function () {
             this.addEventListener('readystatechange', () => {
                 if (this.readyState === 4) {
@@ -103,6 +116,7 @@
             const token = h.replace(/^Bearer\s+/i, '');
             if (token && token.toLowerCase() !== 'dummy') {
                 accessToken = token;
+                maybeStopIntercept();
             }
         }
     }
@@ -113,6 +127,7 @@
             const session = await (await fetch('/api/auth/session?unstable_client=true')).json();
             if (session.accessToken) {
                 accessToken = session.accessToken;
+                maybeStopIntercept();
                 return accessToken;
             }
         } catch (_) {}
