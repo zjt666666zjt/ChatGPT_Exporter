@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         ChatGPT Universal Exporter Enhanced (enhanced)
+// @name         ChatGPT Universal Exporter Enhanced (Fixed)
 // @description  Robust ZIP exporter with JSON/Markdown/HTML, safer intercept, full-thread export, and retries.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
