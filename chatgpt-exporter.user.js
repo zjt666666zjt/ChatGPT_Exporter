@@ -18,13 +18,27 @@
     const PAGE_LIMIT = 100;
     let accessToken = null;
     let capturedWorkspaceIds = new Set();
+    let stopNetworkIntercept = () => {};
+    let interceptStopped = false;
 
     // 导出格式配置 Export formats
     let exportFormats = { json: true, markdown: true, html: true };
 
+    // 安全恢复拦截，防止长期劫持 fetch 影响正常聊天
+    function maybeStopIntercept() {
+        if (interceptStopped) return;
+        interceptStopped = true;
+        try { stopNetworkIntercept(); } catch (_) {}
+    }
+
     // --- 网络拦截与信息捕获 Network intercept (minimal & safe) ---
     (function interceptNetwork() {
         const rawFetch = window.fetch;
+        const rawOpen = XMLHttpRequest.prototype.open;
+        stopNetworkIntercept = () => {
+            window.fetch = rawFetch;
+            XMLHttpRequest.prototype.open = rawOpen;
+        };
         function isSameOriginResource(res) {
             try {
                 const url = typeof res === 'string' ? new URL(res, location.href) : new URL(res.url, location.href);
@@ -67,7 +81,6 @@
             return rawFetch.apply(this, arguments);
         };
 
-        const rawOpen = XMLHttpRequest.prototype.open;
         XMLHttpRequest.prototype.open = function () {
             this.addEventListener('readystatechange', () => {
                 if (this.readyState === 4) {
@@ -103,6 +116,7 @@
             const token = h.replace(/^Bearer\s+/i, '');
             if (token && token.toLowerCase() !== 'dummy') {
                 accessToken = token;
+                maybeStopIntercept();
             }
         }
     }
@@ -113,6 +127,7 @@
             const session = await (await fetch('/api/auth/session?unstable_client=true')).json();
             if (session.accessToken) {
                 accessToken = session.accessToken;
+                maybeStopIntercept();
                 return accessToken;
             }
         } catch (_) {}
@@ -331,32 +346,41 @@
     }
 
     // --- 导出流程 Export process ---
-    async function startExportProcess(mode, workspaceId, formats) {
+    async function startExportProcess(mode, workspaceId, formats, selectedConversations = []) {
         const btn = document.getElementById('gpt-rescue-btn');
         btn.disabled = true;
         if (!await ensureAccessToken()) { btn.disabled = false; btn.textContent = 'Export Conversations'; return; }
         try {
             const zip = new JSZip();
-            btn.textContent = '📂 获取项目外对话…';
-            const orphanIds = await collectIds(btn, workspaceId, null);
-            for (let i = 0; i < orphanIds.length; i++) {
-                btn.textContent = `📥 根目录 (${i + 1}/${orphanIds.length})`;
-                const convData = await getConversation(orphanIds[i], workspaceId);
+            if (!selectedConversations.length) throw new Error('没有需要导出的对话。');
+            const rootConvs = selectedConversations.filter(c => !c.projectId);
+            const projectMap = {};
+            selectedConversations.filter(c => c.projectId).forEach(c => {
+                if (!projectMap[c.projectId]) projectMap[c.projectId] = { title: c.projectTitle || c.projectId, items: [] };
+                projectMap[c.projectId].items.push(c);
+            });
+
+            btn.textContent = '📂 导出项目外对话…';
+            for (let i = 0; i < rootConvs.length; i++) {
+                const conv = rootConvs[i];
+                btn.textContent = `📥 根目录 (${i + 1}/${rootConvs.length})`;
+                const convData = await getConversation(conv.id, workspaceId);
                 if (formats.json) zip.file(generateUniqueFilename(convData, 'json'), JSON.stringify(convData, null, 2));
                 if (formats.markdown) zip.file(generateUniqueFilename(convData, 'md'), convertToMarkdown(convData));
                 if (formats.html) zip.file(generateUniqueFilename(convData, 'html'), convertToHTML(convData));
                 await sleep(jitter());
             }
-            btn.textContent = '🔍 获取项目列表…';
-            const projects = await getProjects(workspaceId);
-            for (const project of projects) {
-                const projectFolder = zip.folder(sanitizeFilename(project.title));
-                btn.textContent = `📂 项目: ${project.title}`;
-                const projectConvIds = await collectIds(btn, workspaceId, project.id);
-                if (projectConvIds.length === 0) continue;
-                for (let i = 0; i < projectConvIds.length; i++) {
-                    btn.textContent = `📥 ${project.title.substring(0,10)}... (${i + 1}/${projectConvIds.length})`;
-                    const convData = await getConversation(projectConvIds[i], workspaceId);
+
+            const projectEntries = Object.entries(projectMap);
+            for (const [projectId, detail] of projectEntries) {
+                const folderName = sanitizeFilename(detail.title || projectId);
+                const projectFolder = zip.folder(folderName);
+                btn.textContent = `📂 项目: ${folderName}`;
+                const list = detail.items;
+                for (let i = 0; i < list.length; i++) {
+                    const conv = list[i];
+                    btn.textContent = `📥 ${folderName.substring(0,10)}... (${i + 1}/${list.length})`;
+                    const convData = await getConversation(conv.id, workspaceId);
                     if (formats.json) projectFolder.file(generateUniqueFilename(convData, 'json'), JSON.stringify(convData, null, 2));
                     if (formats.markdown) projectFolder.file(generateUniqueFilename(convData, 'md'), convertToMarkdown(convData));
                     if (formats.html) projectFolder.file(generateUniqueFilename(convData, 'html'), convertToHTML(convData));
@@ -423,6 +447,61 @@
         return Array.from(all);
     }
 
+    async function listConversationMetas(mode, workspaceId, progressCb = () => {}) {
+        if (!await ensureAccessToken()) throw new Error('无法获取 Access Token，无法列出对话。');
+        const headers = buildHeaders(workspaceId);
+        const all = [];
+        const seen = new Set();
+        const pushItem = (item, projectInfo = {}) => {
+            if (!item || !item.id || seen.has(item.id)) return;
+            seen.add(item.id);
+            all.push({
+                id: item.id,
+                title: item.title || '未命名对话',
+                projectId: projectInfo.id || null,
+                projectTitle: projectInfo.title || ''
+            });
+        };
+
+        // 根目录对话
+        progressCb('加载项目外对话列表…');
+        for (const is_archived of [false, true]) {
+            let offset = 0, has_more = true, page = 0;
+            do {
+                progressCb(`加载项目外对话 ${is_archived ? 'Archived' : 'Active'} 第 ${++page} 页…`);
+                const r = await fetchWithRetry(`/backend-api/conversations?offset=${offset}&limit=${PAGE_LIMIT}&order=updated${is_archived ? '&is_archived=true' : ''}`, { headers });
+                if (!r.ok) throw new Error(`列举项目外对话列表失败 (${r.status})`);
+                const j = await r.json();
+                if (j.items && j.items.length > 0) {
+                    j.items.forEach(it => pushItem(it));
+                    has_more = j.items.length === PAGE_LIMIT;
+                    offset += j.items.length;
+                } else { has_more = false; }
+                await sleep(jitter());
+            } while (has_more);
+        }
+
+        // 项目内对话（仅团队空间有）
+        if (workspaceId) {
+            const projects = await getProjects(workspaceId);
+            for (const project of projects) {
+                let cursor = '0';
+                do {
+                    progressCb(`加载项目 ${project.title}…`);
+                    const r = await fetchWithRetry(`/backend-api/gizmos/${project.id}/conversations?cursor=${cursor}`, { headers });
+                    if (!r.ok) throw new Error(`列举项目 ${project.title} 对话列表失败 (${r.status})`);
+                    const j = await r.json();
+                    j.items?.forEach(it => pushItem(it, { id: project.id, title: project.title }));
+                    cursor = j.cursor;
+                    await sleep(jitter());
+                } while (cursor);
+            }
+        }
+
+        progressCb(`已加载 ${all.length} 个对话，可勾选导出。`);
+        return all;
+    }
+
     async function getConversation(id, workspaceId) {
         const headers = buildHeaders(workspaceId);
         const r = await fetchWithRetry(`/backend-api/conversation/${id}`, { headers });
@@ -482,6 +561,15 @@
                 <div id="detected"></div>
                 <input type="text" id="team-id" placeholder="或在此粘贴 Team Workspace ID (ws-...)" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;">
             </div>
+            <div id="conv-select-area" style="margin-top:12px;border-top:1px solid #eee;padding-top:10px;">
+                <div style="font-size:13px;font-weight:600;margin-bottom:6px;">选择要导出的对话</div>
+                <div id="conv-select-status" style="font-size:12px;color:#666;margin-bottom:6px;">加载中…</div>
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                    <button id="conv-refresh" style="padding:4px 8px;border:1px solid #ccc;border-radius:6px;background:#f5f5f5;cursor:pointer;font-size:12px;">刷新列表</button>
+                    <label style="font-size:12px;color:#555;"><input type="checkbox" id="conv-select-all" checked> 全选</label>
+                </div>
+                <div id="conv-list" style="max-height:180px;overflow-y:auto;border:1px solid #eee;border-radius:6px;padding:6px;background:#fafafa;font-size:13px;line-height:1.4;"></div>
+            </div>
             <div style="margin-top:14px;display:flex;justify-content:flex-end;gap:10px;">
                 <button id="dlg-cancel" style="padding:8px 12px;border:1px solid #ccc;border-radius:8px;background:#fff;cursor:pointer;">取消</button>
                 <button id="dlg-start" style="padding:8px 12px;border:none;border-radius:8px;background:#10a37f;color:#fff;cursor:pointer;font-weight:bold;">开始导出</button>
@@ -492,10 +580,136 @@
         const radioTeam = dialog.querySelector('input[name="mode"][value="team"]');
         const teamArea = dialog.querySelector('#team-area');
         const detectedDiv = dialog.querySelector('#detected');
-        radioTeam.addEventListener('change', () => teamArea.style.display = 'block');
-        radioPersonal.addEventListener('change', () => teamArea.style.display = 'none');
+        const teamInput = dialog.querySelector('#team-id');
+        const convStatus = dialog.querySelector('#conv-select-status');
+        const convListEl = dialog.querySelector('#conv-list');
+        const convRefresh = dialog.querySelector('#conv-refresh');
+        const convSelectAll = dialog.querySelector('#conv-select-all');
+        const convCache = {};
+        let loadToken = 0;
+
+        const renderConversationList = (items) => {
+            convListEl.innerHTML = '';
+            if (!items.length) {
+                convListEl.innerHTML = '<div style="font-size:12px;color: #777;">暂无可用对话</div>';
+                convSelectAll.checked = false;
+                return;
+            }
+
+            const roots = [];
+            const projectMap = {};
+            const projectOrder = [];
+            items.forEach(it => {
+                if (it.projectId) {
+                    if (!projectMap[it.projectId]) {
+                        projectMap[it.projectId] = { title: it.projectTitle || it.projectId, list: [] };
+                        projectOrder.push(it.projectId);
+                    }
+                    projectMap[it.projectId].list.push(it);
+                } else {
+                    roots.push(it);
+                }
+            });
+
+            const frag = document.createDocumentFragment();
+
+            // 项目分组
+            projectOrder.forEach(pid => {
+                const detail = projectMap[pid];
+                if (!detail.list.length) return;
+                const wrap = document.createElement('details');
+                wrap.style.margin = '6px 0';
+                const summary = document.createElement('summary');
+                summary.style.cursor = 'pointer';
+                summary.style.fontWeight = '600';
+                summary.textContent = `项目 ${sanitizeFilename(detail.title)} (${detail.list.length})`;
+                wrap.appendChild(summary);
+
+                detail.list.forEach(item => {
+                    const row = document.createElement('label');
+                    Object.assign(row.style, { display:'flex', alignItems:'center', justifyContent:'space-between', padding:'4px 2px 4px 16px', borderBottom:'1px solid #eee' });
+                    row.innerHTML = `
+                        <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${sanitizeFilename(item.title)}</span>
+                        <input class="conv-check" type="checkbox" data-id="${item.id}" data-project="${item.projectId}" data-project-title="${sanitizeFilename(detail.title)}" data-title="${sanitizeFilename(item.title)}" checked>
+                    `;
+                    wrap.appendChild(row);
+                });
+                frag.appendChild(wrap);
+            });
+
+            // 根目录对话
+            roots.forEach(item => {
+                const row = document.createElement('label');
+                Object.assign(row.style, { display:'flex', alignItems:'center', justifyContent:'space-between', padding:'4px 2px', borderBottom:'1px solid #eee' });
+                row.innerHTML = `
+                    <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${sanitizeFilename(item.title)}</span>
+                    <input class="conv-check" type="checkbox" data-id="${item.id}" data-project="" data-project-title="" data-title="${sanitizeFilename(item.title)}" checked>
+                `;
+                frag.appendChild(row);
+            });
+
+            convListEl.appendChild(frag);
+            convSelectAll.checked = true;
+        };
+
+        const determineWorkspace = () => {
+            const mode = radioTeam.checked ? 'team' : 'personal';
+            if (mode === 'personal') return { mode, workspaceId: null };
+            const manual = teamInput.value.trim();
+            const workspaceId = manual || ids[0] || '';
+            return { mode, workspaceId };
+        };
+
+        const loadConversationList = async (showWarnOnMissing = false) => {
+            const { mode, workspaceId } = determineWorkspace();
+            if (mode === 'team' && !workspaceId) {
+                convStatus.textContent = '请输入有效的 Team Workspace ID 后再刷新列表。';
+                convListEl.innerHTML = '';
+                convSelectAll.checked = false;
+                if (showWarnOnMissing) alert('请输入一个有效的 Team Workspace ID 再加载对话列表。');
+                return;
+            }
+            const cacheKey = `${mode}:${workspaceId || 'personal'}`;
+            if (convCache[cacheKey]) {
+                convStatus.textContent = `已加载 ${convCache[cacheKey].length} 个对话（缓存）`;
+                renderConversationList(convCache[cacheKey]);
+                return;
+            }
+            const token = ++loadToken;
+            convStatus.textContent = '加载对话列表中…';
+            convListEl.innerHTML = '';
+            try {
+                const data = await listConversationMetas(mode, workspaceId || null, (msg) => { if (token === loadToken) convStatus.textContent = msg; });
+                if (token !== loadToken) return;
+                convCache[cacheKey] = data;
+                renderConversationList(data);
+            } catch (e) {
+                if (token !== loadToken) return;
+                convStatus.textContent = `加载失败: ${e.message}`;
+                convListEl.innerHTML = '<div style="font-size:12px;color:#c00;">无法加载对话列表</div>';
+                convSelectAll.checked = false;
+            }
+        };
+
+        convSelectAll.addEventListener('change', () => {
+            convListEl.querySelectorAll('.conv-check').forEach(cb => { cb.checked = convSelectAll.checked; });
+        });
+        convListEl.addEventListener('change', () => {
+            const checks = Array.from(convListEl.querySelectorAll('.conv-check'));
+            convSelectAll.checked = checks.length > 0 && checks.every(cb => cb.checked);
+        });
+        convRefresh.onclick = () => { loadConversationList(true); };
         const ids = detectAllWorkspaceIds();
-        if (ids.length) { detectedDiv.textContent = ids.join(' , '); }
+        if (ids.length) {
+            detectedDiv.textContent = ids.join(' , ');
+            radioTeam.checked = true;
+            radioPersonal.checked = false;
+        }
+        teamArea.style.display = 'block';
+        radioTeam.addEventListener('change', () => { loadConversationList(); });
+        radioPersonal.addEventListener('change', () => { loadConversationList(); });
+        teamInput.addEventListener('change', () => { loadConversationList(); });
+        loadConversationList();
         dialog.querySelector('#dlg-cancel').onclick = () => document.body.removeChild(overlay);
         dialog.querySelector('#dlg-start').onclick = async () => {
             const formats = { json: dialog.querySelector('#fmt-json').checked, markdown: dialog.querySelector('#fmt-md').checked, html: dialog.querySelector('#fmt-html').checked };
@@ -503,13 +717,30 @@
             const mode = radioTeam.checked ? 'team' : 'personal';
             let workspaceId = null;
             if (mode === 'team') {
-                const manual = dialog.querySelector('#team-id').value.trim();
+                const manual = teamInput.value.trim();
                 workspaceId = manual || ids[0] || '';
                 if (!workspaceId) { alert('请选择或输入一个有效的 Team Workspace ID！'); return; }
             }
+            const selected = Array.from(dialog.querySelectorAll('.conv-check:checked')).map(cb => ({
+                id: cb.getAttribute('data-id'),
+                projectId: cb.getAttribute('data-project') || null,
+                projectTitle: cb.getAttribute('data-project-title') || '',
+                title: cb.getAttribute('data-title') || ''
+            }));
+            if (!selected.length) {
+                await loadConversationList(true);
+                const retrySelected = Array.from(dialog.querySelectorAll('.conv-check:checked')).map(cb => ({
+                    id: cb.getAttribute('data-id'),
+                    projectId: cb.getAttribute('data-project') || null,
+                    projectTitle: cb.getAttribute('data-project-title') || '',
+                    title: cb.getAttribute('data-title') || ''
+                }));
+                if (!retrySelected.length) { alert('请至少勾选一个要导出的对话。'); return; }
+                selected.splice(0, selected.length, ...retrySelected);
+            }
             document.body.removeChild(overlay);
             exportFormats.mode = mode; exportFormats.workspaceId = workspaceId;
-            startExportProcess(mode, workspaceId, formats);
+            startExportProcess(mode, workspaceId, formats, selected);
         };
         overlay.onclick = (e) => { if (e.target === overlay) document.body.removeChild(overlay); };
     }
