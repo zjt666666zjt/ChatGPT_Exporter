@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Universal Exporter Enhanced Beta
 // @namespace    https://github.com/zjt666666zjt/ChatGPT_Exporter
-// @version      1.1.0-beta.2
+// @version      1.1.0-beta.3
 // @description  Export ChatGPT conversations and Projects to ZIP as JSON, Markdown, and readable HTML with adaptive retry and failure reports.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -18,7 +18,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.1.0-beta.2';
+    const VERSION = '1.1.0-beta.3';
     const PAGE_LIMIT = 100;
     const BASE_DELAY = 650;
     const JITTER = 350;
@@ -252,7 +252,7 @@
 
     function safeUrl(raw) {
         try {
-            const value = String(raw || '').trim();
+            const value = String(raw || '').trim().replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
             const url = new URL(value, 'https://chatgpt.com/');
             if (!['http:', 'https:', 'mailto:'].includes(url.protocol)) return '#';
             return escapeHtml(value);
@@ -267,20 +267,20 @@
         const token = html => {
             const id = tokens.length;
             tokens.push(html);
-            return `@@UE_TOKEN_${id}@@`;
+            return `§§UETOKEN${id}§§`;
         };
 
         text = text.replace(/`([^`\n]+)`/g, (_, code) => token(`<code>${escapeHtml(code)}</code>`));
         text = text.replace(/\$([^$\n]+)\$/g, (_, math) => token(`<span class="math-inline">${escapeHtml(math)}</span>`));
         text = escapeHtml(text);
-        text = text.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+&quot;.*?&quot;)?\)/g, (_, alt, url) => `<img src="${safeUrl(url)}" alt="${alt}" loading="lazy">`);
-        text = text.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+&quot;.*?&quot;)?\)/g, (_, label, url) => `<a href="${safeUrl(url)}" target="_blank" rel="noreferrer noopener">${label}</a>`);
+        text = text.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+&quot;.*?&quot;)?\)/g, (_, alt, url) => token(`<img src="${safeUrl(url)}" alt="${alt}" loading="lazy">`));
+        text = text.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+&quot;.*?&quot;)?\)/g, (_, label, url) => token(`<a href="${safeUrl(url)}" target="_blank" rel="noreferrer noopener">${label}</a>`));
         text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
         text = text.replace(/__([^_]+)__/g, '<strong>$1</strong>');
         text = text.replace(/~~([^~]+)~~/g, '<del>$1</del>');
         text = text.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
         text = text.replace(/(^|[^_])_([^_\n]+)_/g, '$1<em>$2</em>');
-        text = text.replace(/@@UE_TOKEN_(\d+)@@/g, (_, index) => tokens[Number(index)] || '');
+        text = text.replace(/§§UETOKEN(\d+)§§/g, (_, index) => tokens[Number(index)] || '');
         return text;
     }
 
