@@ -4,6 +4,10 @@ All notable maintenance changes to ChatGPT_Exporter are documented here.
 
 ## [Unreleased] — v1.1.0 Beta
 
+### Beta v1.1.0-beta.3
+- Fixed inline Markdown token handling so inline code, math notation, links, and images are not accidentally re-parsed as emphasis.
+- Fixed escaped query-string handling in exported HTML links.
+
 ### Beta v1.1.0-beta.2
 - Adaptive pacing and `Retry-After` aware exponential backoff for large exports and HTTP 429/5xx responses.
 - More complete Project/Gizmo pagination, including `cursor` / `next_cursor`, `has_more` / `hasMore`, repeated-cursor protection, and a first-page fallback for endpoints that still require `cursor=0`.
@@ -16,7 +20,7 @@ All notable maintenance changes to ChatGPT_Exporter are documented here.
 
 ### Scope
 - This maintenance cycle changes the **Beta userscript only**. The stable `chatgpt-exporter.user.js` is intentionally unchanged.
-- Issues #6, #7 and #8 are addressed by this Beta maintenance release. Safari compatibility in #9 is improved at the script level, but still depends on the Safari userscript manager/browser environment.
+- Issues #6, #7 and #8 were addressed by this Beta maintenance release.
 
 ## [2025-12-07]
 - Added conversation selection and project grouping improvements.
