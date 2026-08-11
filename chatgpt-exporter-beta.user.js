@@ -1,10 +1,15 @@
 // ==UserScript==
 // @name         ChatGPT Universal Exporter Enhanced Beta
-// @version      1.1.0-beta.1
-// @description  Robust ZIP exporter with JSON/Markdown/HTML, safer intercept, full-thread export, and retries.
+// @namespace    https://github.com/zjt666666zjt/ChatGPT_Exporter
+// @version      1.1.0-beta.2
+// @description  Export ChatGPT conversations and Projects to ZIP as JSON, Markdown, and readable HTML with adaptive retry and failure reports.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
+// @homepageURL  https://github.com/zjt666666zjt/ChatGPT_Exporter
+// @supportURL   https://github.com/zjt666666zjt/ChatGPT_Exporter/issues
+// @downloadURL  https://raw.githubusercontent.com/zjt666666zjt/ChatGPT_Exporter/main/chatgpt-exporter-beta.user.js
+// @updateURL    https://raw.githubusercontent.com/zjt666666zjt/ChatGPT_Exporter/main/chatgpt-exporter-beta.user.js
 // @grant        none
 // @license      MIT
 // @run-at       document-start
@@ -13,210 +18,95 @@
 (function () {
     'use strict';
 
-    // ==========================================
-    // 1. 核心配置 Core Config
-    // ==========================================
-
-    // Conservatively pace backend requests. Large exports are especially prone to 429s.
+    const VERSION = '1.1.0-beta.2';
+    const PAGE_LIMIT = 100;
     const BASE_DELAY = 650;
     const JITTER = 350;
-    const PAGE_LIMIT = 100;
     const RETRY_BASE_DELAY = 2000;
-    const MAX_RETRY_DELAY = 30000;
+    const MAX_RETRY_DELAY = 60000;
+    const MAX_RETRIES = 5;
+
     let accessToken = null;
-    let capturedWorkspaceIds = new Set();
+    const capturedWorkspaceIds = new Set();
+    let adaptiveDelay = BASE_DELAY;
+    let nextRequestAt = 0;
 
-    // 导出格式配置 Export formats
-    let exportFormats = { json: true, markdown: true, html: true };
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const sanitizeFilename = value => String(value || 'Untitled')
+        .replace(/[\/\\?%*:|"<>\x00-\x1F]/g, '-')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 160) || 'Untitled';
 
-    // 按钮图标（SVG）
-    const ICON_DOWNLOAD = `
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"></path>
-        </svg>
-    `;
-    const ICON_SPINNER = `
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-            <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2" fill="none" opacity="0.25"></circle>
-            <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"></path>
-        </svg>
-    `;
-    const ICON_CHECK = `
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M9 16.2l-3.5-3.5L4 14.2 9 19l11-11-1.5-1.5z"></path>
-        </svg>
-    `;
-    const ICON_ERROR = `
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M1 21h22L12 2 1 21zm12-3h-2v2h2v-2zm0-8h-2v6h2v-6z"></path>
-        </svg>
-    `;
+    const ICON_DOWNLOAD = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"></path></svg>`;
+    const ICON_SPINNER = `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2" fill="none" opacity="0.25"></circle><path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"></path></svg>`;
+    const ICON_CHECK = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 16.2l-3.5-3.5L4 14.2 9 19l11-11-1.5-1.5z"></path></svg>`;
+    const ICON_ERROR = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M1 21h22L12 2 1 21zm12-3h-2v2h2v-2zm0-8h-2v6h2v-6z"></path></svg>`;
 
-    // ==========================================
-    // 2. 网络拦截，捕获 Token / WorkspaceId
-    // ==========================================
-
-    (function interceptNetwork() {
+    (function interceptFetch() {
         const rawFetch = window.fetch;
-
-        function isSameOriginResource(res) {
-            try {
-                const url = typeof res === 'string' ? new URL(res, location.href) : new URL(res.url, location.href);
-                return url.origin === location.origin;
-            } catch (_) {
-                return true;
-            }
-        }
-
-        function getHeaderValueFromAny(hLike, name) {
-            if (!hLike) return null;
-            try {
-                if (hLike instanceof Headers) return hLike.get(name) || hLike.get(name.toLowerCase());
-                if (Array.isArray(hLike)) {
-                    const found = hLike.find(
-                        p => Array.isArray(p) && String(p[0]).toLowerCase() === name.toLowerCase()
-                    );
-                    return found ? found[1] : null;
-                }
-                if (typeof hLike === 'object') return hLike[name] || hLike[name.toLowerCase()] || null;
-                if (typeof hLike === 'string' && name.toLowerCase() === 'authorization') return hLike;
-            } catch (_) {}
-            return null;
-        }
-
+        if (typeof rawFetch !== 'function') return;
         window.fetch = function (resource, options) {
             try {
-                if (isSameOriginResource(resource)) {
-                    const headerCandidates = [];
-                    if (resource && typeof Request !== 'undefined' && resource instanceof Request) {
-                        headerCandidates.push(resource.headers);
-                    }
-                    if (options && options.headers) {
-                        headerCandidates.push(options.headers);
-                    }
-                    for (const hc of headerCandidates) {
-                        tryCaptureToken(getHeaderValueFromAny(hc, 'Authorization'));
-                        const wid = getHeaderValueFromAny(hc, 'ChatGPT-Account-Id');
-                        if (wid && !capturedWorkspaceIds.has(wid)) {
-                            capturedWorkspaceIds.add(wid);
-                        }
-                    }
+                const requestUrl = resource instanceof Request ? resource.url : String(resource || '');
+                const url = new URL(requestUrl, location.href);
+                if (url.origin === location.origin) {
+                    const candidates = [];
+                    if (resource instanceof Request) candidates.push(resource.headers);
+                    if (options && options.headers) candidates.push(options.headers);
+                    for (const headersLike of candidates) captureHeaders(headersLike);
                 }
             } catch (_) {}
             return rawFetch.apply(this, arguments);
         };
-
-        const rawOpen = XMLHttpRequest.prototype.open;
-        XMLHttpRequest.prototype.open = function () {
-            this.addEventListener('readystatechange', () => {
-                if (this.readyState === 4) {
-                    try {
-                        const auth = this.getRequestHeader && this.getRequestHeader('Authorization');
-                        tryCaptureToken(auth);
-                        const id = this.getRequestHeader && this.getRequestHeader('ChatGPT-Account-Id');
-                        if (id && !capturedWorkspaceIds.has(id)) {
-                            capturedWorkspaceIds.add(id);
-                        }
-                    } catch (_) {}
-                }
-            });
-            return rawOpen.apply(this, arguments);
-        };
     })();
 
-    function tryCaptureToken(headerLike) {
-        let h = null;
+    function headerValue(headersLike, name) {
+        if (!headersLike) return null;
+        const needle = name.toLowerCase();
         try {
-            if (!headerLike) {
-                h = null;
-            } else if (typeof headerLike === 'string') {
-                h = headerLike;
-            } else if (headerLike instanceof Headers) {
-                h = headerLike.get('Authorization') || headerLike.get('authorization');
-            } else if (Array.isArray(headerLike)) {
-                const found = headerLike.find(
-                    e => Array.isArray(e) && String(e[0]).toLowerCase() === 'authorization'
-                );
-                h = found ? found[1] : null;
-            } else if (typeof headerLike === 'object') {
-                h = headerLike.Authorization || headerLike.authorization || null;
+            if (headersLike instanceof Headers) return headersLike.get(name);
+            if (Array.isArray(headersLike)) {
+                const pair = headersLike.find(entry => Array.isArray(entry) && String(entry[0]).toLowerCase() === needle);
+                return pair ? pair[1] : null;
+            }
+            if (typeof headersLike === 'object') {
+                const key = Object.keys(headersLike).find(k => k.toLowerCase() === needle);
+                return key ? headersLike[key] : null;
             }
         } catch (_) {}
-        if (h && /^Bearer\s+(.+)/i.test(h)) {
-            const token = h.replace(/^Bearer\s+/i, '');
-            if (token && token.toLowerCase() !== 'dummy') {
-                accessToken = token;
-            }
+        return null;
+    }
+
+    function captureHeaders(headersLike) {
+        const auth = headerValue(headersLike, 'Authorization');
+        if (auth && /^Bearer\s+(.+)/i.test(String(auth))) {
+            const token = String(auth).replace(/^Bearer\s+/i, '').trim();
+            if (token && token.toLowerCase() !== 'dummy') accessToken = token;
         }
+        const workspaceId = headerValue(headersLike, 'ChatGPT-Account-Id');
+        if (workspaceId) capturedWorkspaceIds.add(String(workspaceId));
     }
 
     async function ensureAccessToken() {
         if (accessToken) return accessToken;
         try {
-            const res = await fetch('/api/auth/session?unstable_client=true');
-            const session = await res.json();
-            if (session && session.accessToken) {
-                accessToken = session.accessToken;
-                return accessToken;
+            const response = await fetch('/api/auth/session?unstable_client=true');
+            if (response.ok) {
+                const session = await response.json();
+                if (session && session.accessToken) {
+                    accessToken = session.accessToken;
+                    return accessToken;
+                }
             }
         } catch (_) {}
-        alert('无法获取 Access Token。请刷新页面或打开任意一个对话后再试。');
+        alert('无法获取 Access Token。请刷新 ChatGPT，打开任意一个对话后再试。');
         return null;
     }
 
-    // ==========================================
-    // 3. 通用辅助函数 Helpers
-    // ==========================================
-
-    const sleep = ms => new Promise(r => setTimeout(r, ms));
-    const jitter = () => BASE_DELAY + Math.random() * JITTER;
-    const sanitizeFilename = name => name.replace(/[\/\\?%*:|"<>]/g, '-').trim();
-
     function getOaiDeviceId() {
-        const cookieString = document.cookie;
-        const match = cookieString.match(/oai-did=([^;]+)/);
-        return match ? match[1] : null;
-    }
-
-    function getRetryAfterMs(res) {
-        const raw = res && res.headers && res.headers.get('Retry-After');
-        if (!raw) return 0;
-        const seconds = Number(raw);
-        if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
-        const dateMs = Date.parse(raw);
-        return Number.isFinite(dateMs) ? Math.max(0, dateMs - Date.now()) : 0;
-    }
-
-    async function fetchWithRetry(input, init = {}, retries = 5) {
-        let attempt = 0;
-        while (true) {
-            try {
-                const res = await fetch(input, init);
-                if (res.ok) return res;
-                if (attempt < retries && (res.status === 429 || res.status >= 500)) {
-                    const retryAfter = getRetryAfterMs(res);
-                    const backoff = Math.min(
-                        MAX_RETRY_DELAY,
-                        RETRY_BASE_DELAY * Math.pow(2, attempt) + Math.random() * JITTER
-                    );
-                    await sleep(Math.max(retryAfter, backoff));
-                    attempt++;
-                    continue;
-                }
-                return res;
-            } catch (err) {
-                if (attempt < retries) {
-                    const backoff = Math.min(
-                        MAX_RETRY_DELAY,
-                        RETRY_BASE_DELAY * Math.pow(2, attempt) + Math.random() * JITTER
-                    );
-                    await sleep(backoff);
-                    attempt++;
-                    continue;
-                }
-                throw err;
-            }
-        }
+        const match = document.cookie.match(/(?:^|;\s*)oai-did=([^;]+)/);
+        return match ? decodeURIComponent(match[1]) : null;
     }
 
     function buildHeaders(workspaceId) {
@@ -227,843 +117,685 @@
         return headers;
     }
 
-    function generateUniqueFilename(convData, extension = 'json') {
-        const convId = String(convData.conversation_id || '').trim();
-        const idPart = convId || Math.random().toString(36).slice(2, 10);
-        const ts = convData.create_time ? new Date(convData.create_time * 1000) : new Date();
-        const tsPart = `${ts.getFullYear()}${String(ts.getMonth() + 1).padStart(2, '0')}${String(
-            ts.getDate()
-        ).padStart(2, '0')}_${String(ts.getHours()).padStart(2, '0')}${String(
-            ts.getMinutes()
-        ).padStart(2, '0')}${String(ts.getSeconds()).padStart(2, '0')}`;
-        let baseName = convData.title;
-        if (!baseName || baseName.trim().toLowerCase() === 'new chat') {
-            baseName = 'Untitled Conversation';
+    function getRetryAfterMs(response) {
+        const raw = response && response.headers ? response.headers.get('Retry-After') : null;
+        if (!raw) return 0;
+        const seconds = Number(raw);
+        if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+        const absolute = Date.parse(raw);
+        return Number.isFinite(absolute) ? Math.max(0, absolute - Date.now()) : 0;
+    }
+
+    async function paceRequest(extra = 0) {
+        const now = Date.now();
+        const wait = Math.max(0, nextRequestAt - now, extra);
+        if (wait) await sleep(wait);
+        nextRequestAt = Date.now() + adaptiveDelay + Math.random() * JITTER;
+    }
+
+    async function fetchWithRetry(input, init = {}, retries = MAX_RETRIES) {
+        let attempt = 0;
+        while (true) {
+            await paceRequest();
+            try {
+                const response = await fetch(input, init);
+                if (response.ok) {
+                    adaptiveDelay = Math.max(BASE_DELAY, adaptiveDelay * 0.92);
+                    return response;
+                }
+
+                const retryable = [408, 425, 429, 500, 502, 503, 504].includes(response.status);
+                if (!retryable || attempt >= retries) return response;
+
+                const serverDelay = getRetryAfterMs(response);
+                const exponential = Math.min(MAX_RETRY_DELAY, RETRY_BASE_DELAY * Math.pow(2, attempt));
+                const wait = Math.min(MAX_RETRY_DELAY, Math.max(serverDelay, exponential) + Math.random() * JITTER);
+                if (response.status === 429) adaptiveDelay = Math.min(5000, Math.max(adaptiveDelay * 1.7, BASE_DELAY + 500));
+                attempt++;
+                await paceRequest(wait);
+            } catch (error) {
+                if (attempt >= retries) throw error;
+                const wait = Math.min(MAX_RETRY_DELAY, RETRY_BASE_DELAY * Math.pow(2, attempt) + Math.random() * JITTER);
+                attempt++;
+                await paceRequest(wait);
+            }
         }
-        return `${sanitizeFilename(baseName)}_${idPart}_${tsPart}.${extension}`;
     }
 
-    function downloadFile(blob, filename) {
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(a.href);
+    async function requestJson(url, init, context) {
+        const response = await fetchWithRetry(url, init);
+        if (!response.ok) {
+            const error = new Error(`${context || '请求失败'} (${response.status})`);
+            error.status = response.status;
+            throw error;
+        }
+        try {
+            return await response.json();
+        } catch (_) {
+            throw new Error(`${context || '请求失败'}：响应不是有效 JSON`);
+        }
     }
 
-    // ==========================================
-    // 4. 会话解析 & 转换为 Markdown / HTML
-    // ==========================================
+    function partToText(part) {
+        if (typeof part === 'string') return part;
+        if (part == null) return '';
+        if (typeof part === 'number' || typeof part === 'boolean') return String(part);
+        if (typeof part === 'object') {
+            if (typeof part.text === 'string') return part.text;
+            if (typeof part.content === 'string') return part.content;
+            if (typeof part.asset_pointer === 'string') return `[Image: ${part.asset_pointer}]`;
+            if (typeof part.url === 'string') return `[Attachment: ${part.url}]`;
+        }
+        return '';
+    }
+
+    function messageText(message) {
+        const content = message && message.content;
+        if (!content) return '';
+        if (Array.isArray(content.parts)) return content.parts.map(partToText).filter(Boolean).join('\n');
+        if (typeof content.text === 'string') return content.text;
+        return '';
+    }
 
     function parseConversation(convData) {
         const mapping = convData.mapping || {};
-        const msgs = [];
-        for (const key in mapping) {
-            const node = mapping[key];
+        const selected = [];
+        const currentNode = convData.current_node;
+
+        if (currentNode && mapping[currentNode]) {
+            let nodeId = currentNode;
+            const seen = new Set();
+            while (nodeId && mapping[nodeId] && !seen.has(nodeId)) {
+                seen.add(nodeId);
+                selected.push(mapping[nodeId]);
+                nodeId = mapping[nodeId].parent;
+            }
+            selected.reverse();
+        } else {
+            selected.push(...Object.values(mapping));
+            selected.sort((a, b) => ((a?.message?.create_time || 0) - (b?.message?.create_time || 0)));
+        }
+
+        const messages = [];
+        for (const node of selected) {
             const message = node && node.message;
-            if (!message || !message.content || !message.content.parts) continue;
-            const role = message.author && message.author.role;
+            const role = message && message.author && message.author.role;
             if (role !== 'user' && role !== 'assistant') continue;
-            const content = message.content.parts.join('\n');
-            if (!content || !content.trim()) continue;
-            msgs.push({
+            const content = messageText(message);
+            if (!content.trim()) continue;
+            messages.push({
                 role,
                 content,
-                createTime: message.create_time,
+                createTime: message.create_time || null,
                 model: (message.metadata && message.metadata.model_slug) || ''
             });
         }
-        msgs.sort((a, b) => (a.createTime || 0) - (b.createTime || 0));
+
         return {
             title: convData.title || 'Untitled Conversation',
-            createTime: convData.create_time,
-            updateTime: convData.update_time,
-            conversationId: convData.conversation_id,
+            createTime: convData.create_time || null,
+            updateTime: convData.update_time || null,
+            conversationId: convData.conversation_id || convData.id || '',
             model: convData.default_model_slug || '',
-            messages: msgs
+            messages
         };
+    }
+
+    function escapeHtml(value) {
+        return String(value == null ? '' : value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    function safeUrl(raw) {
+        try {
+            const value = String(raw || '').trim();
+            const url = new URL(value, 'https://chatgpt.com/');
+            if (!['http:', 'https:', 'mailto:'].includes(url.protocol)) return '#';
+            return escapeHtml(value);
+        } catch (_) {
+            return '#';
+        }
+    }
+
+    function renderInlineMarkdown(input) {
+        let text = String(input || '');
+        const tokens = [];
+        const token = html => {
+            const id = tokens.length;
+            tokens.push(html);
+            return `@@UE_TOKEN_${id}@@`;
+        };
+
+        text = text.replace(/`([^`\n]+)`/g, (_, code) => token(`<code>${escapeHtml(code)}</code>`));
+        text = text.replace(/\$([^$\n]+)\$/g, (_, math) => token(`<span class="math-inline">${escapeHtml(math)}</span>`));
+        text = escapeHtml(text);
+        text = text.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+&quot;.*?&quot;)?\)/g, (_, alt, url) => `<img src="${safeUrl(url)}" alt="${alt}" loading="lazy">`);
+        text = text.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+&quot;.*?&quot;)?\)/g, (_, label, url) => `<a href="${safeUrl(url)}" target="_blank" rel="noreferrer noopener">${label}</a>`);
+        text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+        text = text.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+        text = text.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+        text = text.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+        text = text.replace(/(^|[^_])_([^_\n]+)_/g, '$1<em>$2</em>');
+        text = text.replace(/@@UE_TOKEN_(\d+)@@/g, (_, index) => tokens[Number(index)] || '');
+        return text;
+    }
+
+    function splitTableRow(line) {
+        let value = String(line || '').trim();
+        if (value.startsWith('|')) value = value.slice(1);
+        if (value.endsWith('|')) value = value.slice(0, -1);
+        return value.split('|').map(cell => cell.trim());
+    }
+
+    function isTableSeparator(line) {
+        const cells = splitTableRow(line);
+        return cells.length > 0 && cells.every(cell => /^:?-{3,}:?$/.test(cell));
+    }
+
+    function renderMarkdownToHtml(markdown) {
+        const lines = String(markdown || '').replace(/\r\n?/g, '\n').split('\n');
+        const out = [];
+        let i = 0;
+
+        while (i < lines.length) {
+            const line = lines[i];
+            if (!line.trim()) { i++; continue; }
+
+            const fence = line.match(/^```([^\s`]*)\s*$/);
+            if (fence) {
+                const language = escapeHtml(fence[1] || 'text');
+                const code = [];
+                i++;
+                while (i < lines.length && !/^```\s*$/.test(lines[i])) code.push(lines[i++]);
+                if (i < lines.length) i++;
+                out.push(`<pre><code class="language-${language}">${escapeHtml(code.join('\n'))}</code></pre>`);
+                continue;
+            }
+
+            if (/^\$\$\s*$/.test(line)) {
+                const math = [];
+                i++;
+                while (i < lines.length && !/^\$\$\s*$/.test(lines[i])) math.push(lines[i++]);
+                if (i < lines.length) i++;
+                out.push(`<div class="math-block">${escapeHtml(math.join('\n'))}</div>`);
+                continue;
+            }
+
+            if (i + 1 < lines.length && line.includes('|') && isTableSeparator(lines[i + 1])) {
+                const headers = splitTableRow(line);
+                i += 2;
+                const rows = [];
+                while (i < lines.length && lines[i].includes('|') && lines[i].trim()) rows.push(splitTableRow(lines[i++]));
+                out.push(`<div class="table-wrap"><table><thead><tr>${headers.map(h => `<th>${renderInlineMarkdown(h)}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${headers.map((_, idx) => `<td>${renderInlineMarkdown(row[idx] || '')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`);
+                continue;
+            }
+
+            const heading = line.match(/^(#{1,6})\s+(.+)$/);
+            if (heading) {
+                const level = heading[1].length;
+                out.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
+                i++;
+                continue;
+            }
+
+            if (/^\s*([-*_])(?:\s*\1){2,}\s*$/.test(line)) {
+                out.push('<hr>');
+                i++;
+                continue;
+            }
+
+            if (/^>\s?/.test(line)) {
+                const quote = [];
+                while (i < lines.length && /^>\s?/.test(lines[i])) quote.push(lines[i++].replace(/^>\s?/, ''));
+                out.push(`<blockquote>${renderMarkdownToHtml(quote.join('\n'))}</blockquote>`);
+                continue;
+            }
+
+            if (/^\s*[-+*]\s+/.test(line)) {
+                const items = [];
+                while (i < lines.length && /^\s*[-+*]\s+/.test(lines[i])) items.push(lines[i++].replace(/^\s*[-+*]\s+/, ''));
+                out.push(`<ul>${items.map(item => `<li>${renderInlineMarkdown(item)}</li>`).join('')}</ul>`);
+                continue;
+            }
+
+            if (/^\s*\d+[.)]\s+/.test(line)) {
+                const items = [];
+                while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])) items.push(lines[i++].replace(/^\s*\d+[.)]\s+/, ''));
+                out.push(`<ol>${items.map(item => `<li>${renderInlineMarkdown(item)}</li>`).join('')}</ol>`);
+                continue;
+            }
+
+            const paragraph = [line];
+            i++;
+            while (i < lines.length && lines[i].trim()) {
+                const next = lines[i];
+                if (/^```/.test(next) || /^\$\$\s*$/.test(next) || /^(#{1,6})\s+/.test(next) || /^>\s?/.test(next) || /^\s*[-+*]\s+/.test(next) || /^\s*\d+[.)]\s+/.test(next)) break;
+                if (i + 1 < lines.length && next.includes('|') && isTableSeparator(lines[i + 1])) break;
+                paragraph.push(next);
+                i++;
+            }
+            out.push(`<p>${paragraph.map(renderInlineMarkdown).join('<br>')}</p>`);
+        }
+
+        return out.join('\n');
     }
 
     function convertToMarkdown(convData) {
         const parsed = parseConversation(convData);
-        let md = '';
-        md += `# ${parsed.title}\n\n`;
+        let md = `# ${parsed.title}\n\n`;
         md += `**Conversation ID:** \`${parsed.conversationId || 'Unknown'}\`\n\n`;
         if (parsed.model) md += `**Model:** ${parsed.model}\n\n`;
-        if (parsed.createTime)
-            md += `**Created:** ${new Date(parsed.createTime * 1000).toLocaleString()}\n\n`;
-        if (parsed.updateTime)
-            md += `**Last Updated:** ${new Date(parsed.updateTime * 1000).toLocaleString()}\n\n`;
-        md += `---\n\n`;
-        parsed.messages.forEach((msg, index) => {
-            const roleLabel = msg.role === 'user' ? '👤 User' : '🤖 Assistant';
-            const timestamp = msg.createTime
-                ? ` (${new Date(msg.createTime * 1000).toLocaleString()})`
-                : '';
-            md += `## ${roleLabel}${timestamp}\n\n`;
-            md += `${msg.content}\n\n`;
-            if (index < parsed.messages.length - 1) md += `---\n\n`;
+        if (parsed.createTime) md += `**Created:** ${new Date(parsed.createTime * 1000).toLocaleString()}\n\n`;
+        if (parsed.updateTime) md += `**Last Updated:** ${new Date(parsed.updateTime * 1000).toLocaleString()}\n\n`;
+        md += '---\n\n';
+        parsed.messages.forEach((message, index) => {
+            const role = message.role === 'user' ? '👤 User' : '🤖 Assistant';
+            const time = message.createTime ? ` (${new Date(message.createTime * 1000).toLocaleString()})` : '';
+            md += `## ${role}${time}\n\n${message.content}\n\n`;
+            if (index < parsed.messages.length - 1) md += '---\n\n';
         });
         return md;
     }
 
     function convertToHTML(convData) {
         const parsed = parseConversation(convData);
-        const escapeHtml = text => {
-            const div = document.createElement('div');
-            div.textContent = text == null ? '' : String(text);
-            return div.innerHTML;
-        };
-        const renderContent = content => {
-            let html = escapeHtml(content);
-            const blocks = [];
-            html = html.replace(/```(\w+)?\n([\s\S]*?)```/g, (match, lang, code) => {
-                const idx = blocks.length;
-                const blockHtml = `<pre><code class="language-${lang || 'text'}">${code.trim()}</code></pre>`;
-                blocks.push(blockHtml);
-                return `[[[CODE_BLOCK_${idx}]]]`;
-            });
-            html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-            html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-            html = html.replace(
-                /\[([^\]]+)\]\(([^)]+)\)/g,
-                '<a href="$2" target="_blank" rel="noreferrer noopener">$1</a>'
-            );
-            html = html.replace(/\n/g, '<br>');
-            html = html.replace(/\[\[\[CODE_BLOCK_(\d+)]]]/g, (_, i) => blocks[Number(i)]);
-            return html;
-        };
+        const metadata = [
+            `ID: ${escapeHtml(parsed.conversationId || 'Unknown')}`,
+            parsed.model ? `Model: ${escapeHtml(parsed.model)}` : '',
+            parsed.createTime ? `Created: ${escapeHtml(new Date(parsed.createTime * 1000).toLocaleString())}` : ''
+        ].filter(Boolean).join(' · ');
 
-        const convIdText = parsed.conversationId ? escapeHtml(parsed.conversationId) : 'Unknown';
-        const createdText = parsed.createTime
-            ? new Date(parsed.createTime * 1000).toLocaleString()
-            : '';
+        const messages = parsed.messages.map(message => {
+            const roleLabel = message.role === 'user' ? 'User' : 'Assistant';
+            const timestamp = message.createTime ? new Date(message.createTime * 1000).toLocaleString() : '';
+            return `<article class="message ${message.role}"><header><strong>${roleLabel}</strong>${timestamp ? `<time>${escapeHtml(timestamp)}</time>` : ''}</header><div class="message-content">${renderMarkdownToHtml(message.content)}</div></article>`;
+        }).join('\n');
 
-        let html = `<!DOCTYPE html>
+        return `<!doctype html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${escapeHtml(parsed.title)}</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; line-height: 1.6; color: #333; background: #f5f5f5; padding: 20px; }
-        .container { max-width: 900px; margin: 0 auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); overflow: hidden; }
-        .header { background: linear-gradient(135deg, #10a37f 0%, #0d8a6c 100%); color: #fff; padding: 30px; }
-        .header h1 { font-size: 24px; margin-bottom: 10px; }
-        .metadata { font-size: 13px; opacity: 0.9; }
-        .conversation { padding: 20px; }
-        .message { margin-bottom: 25px; padding: 20px; border-radius: 8px; }
-        .message.user { background: #eef2ff; border-left: 4px solid #4f46e5; }
-        .message.assistant { background: #f9fafb; border-left: 4px solid #10a37f; }
-        .message-header { display: flex; align-items: center; margin-bottom: 12px; font-weight: 600; font-size: 15px; }
-        .role-icon { margin-right: 8px; }
-        .timestamp { font-size: 12px; color: #888; margin-left: auto; font-weight: normal; }
-        pre { background: #2d2d2d; color: #f8f8f2; padding: 15px; border-radius: 6px; overflow-x: auto; margin: 10px 0; }
-        code { font-family: "Consolas", monospace; font-size: 13px; }
-    </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(parsed.title)}</title>
+<style>
+:root{color-scheme:light dark}*{box-sizing:border-box}body{margin:0;background:#f5f5f5;color:#202123;font:15px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}.page{max-width:980px;margin:32px auto;background:#fff;border:1px solid #ddd;border-radius:12px;overflow:hidden;box-shadow:0 8px 30px rgba(0,0,0,.08)}.top{padding:28px 32px;border-bottom:1px solid #e5e5e5}.top h1{margin:0 0 8px;font-size:26px;line-height:1.25}.meta{color:#666;font-size:12px;word-break:break-all}.conversation{padding:26px}.message{padding:20px 22px;margin:0 0 18px;border:1px solid #e5e5e5;border-radius:10px;background:#fff}.message.user{background:#f7f7f8}.message header{display:flex;justify-content:space-between;gap:16px;align-items:center;padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid #eee}.message time{font-size:12px;color:#777}.message-content h1,.message-content h2,.message-content h3,.message-content h4,.message-content h5,.message-content h6{margin:1.2em 0 .55em;line-height:1.3}.message-content h1{font-size:1.65em}.message-content h2{font-size:1.4em}.message-content h3{font-size:1.2em}.message-content p{margin:.7em 0}.message-content ul,.message-content ol{padding-left:1.6em}.message-content blockquote{margin:1em 0;padding:.2em 1em;border-left:4px solid #999;color:#555;background:#fafafa}.message-content pre{margin:1em 0;padding:14px 16px;border-radius:8px;overflow:auto;background:#1f1f1f;color:#f3f3f3;white-space:pre}.message-content code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#eee;padding:.15em .35em;border-radius:4px}.message-content pre code{background:transparent;padding:0}.table-wrap{overflow-x:auto;margin:1em 0}.message-content table{width:100%;border-collapse:collapse}.message-content th,.message-content td{border:1px solid #ccc;padding:7px 9px;text-align:left;vertical-align:top}.message-content th{background:#f3f3f3}.message-content img{max-width:100%;height:auto;border-radius:6px}.message-content a{color:#0969da;word-break:break-word}.math-inline,.math-block{font-family:"Times New Roman",serif;background:#f6f6f6;border-radius:4px}.math-inline{padding:.08em .3em}.math-block{padding:12px 14px;margin:1em 0;white-space:pre-wrap;overflow:auto}hr{border:0;border-top:1px solid #ddd;margin:1.5em 0}@media(max-width:700px){body{background:#fff}.page{margin:0;border:0;border-radius:0}.top,.conversation{padding:18px}.message{padding:16px}}@media(prefers-color-scheme:dark){body{background:#161616;color:#e8e8e8}.page,.message{background:#202020;border-color:#3a3a3a}.message.user{background:#292929}.top,.message header{border-color:#3a3a3a}.meta,.message time{color:#aaa}.message-content blockquote{background:#292929;color:#ccc}.message-content code{background:#333}.message-content th{background:#292929}.message-content th,.message-content td{border-color:#555}.math-inline,.math-block{background:#2c2c2c}.message-content a{color:#6ea8fe}}
+</style>
 </head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>${escapeHtml(parsed.title)}</h1>
-            <div class="metadata">ID: ${convIdText}${
-            createdText ? ' | ' + escapeHtml(createdText) : ''
-        }</div>
-        </div>
-        <div class="conversation">`;
-
-        parsed.messages.forEach(msg => {
-            const roleClass = msg.role;
-            const roleIcon = msg.role === 'user' ? '👤' : '🤖';
-            const roleLabel = msg.role === 'user' ? 'User' : 'Assistant';
-            const timestamp = msg.createTime
-                ? new Date(msg.createTime * 1000).toLocaleString()
-                : '';
-            html += `
-            <div class="message ${roleClass}">
-                <div class="message-header">
-                    <span class="role-icon">${roleIcon}</span>${roleLabel}${
-                timestamp ? `<span class="timestamp">${escapeHtml(timestamp)}</span>` : ''
-            }
-                </div>
-                <div class="message-content">${renderContent(msg.content)}</div>
-            </div>`;
-        });
-
-        html += `</div></div></body></html>`;
-        return html;
+<body><main class="page"><header class="top"><h1>${escapeHtml(parsed.title)}</h1><div class="meta">${metadata}</div></header><section class="conversation">${messages}</section></main></body></html>`;
     }
 
-    // ==========================================
-    // 5. API 辅助：项目列表 / 会话 meta / 会话详情
-    // ==========================================
+    function generateUniqueFilename(convData, extension) {
+        const title = sanitizeFilename(convData.title || 'Untitled Conversation');
+        const id = sanitizeFilename(convData.conversation_id || convData.id || Math.random().toString(36).slice(2, 10));
+        const date = convData.create_time ? new Date(convData.create_time * 1000) : new Date();
+        const stamp = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}_${String(date.getHours()).padStart(2, '0')}${String(date.getMinutes()).padStart(2, '0')}${String(date.getSeconds()).padStart(2, '0')}`;
+        return `${title}_${id}_${stamp}.${extension}`;
+    }
+
+    function normalizeProject(item) {
+        const gizmo = item && (item.gizmo || item.project || item);
+        const id = gizmo && (gizmo.id || gizmo.gizmo_id || gizmo.project_id);
+        const title = gizmo && ((gizmo.display && gizmo.display.name) || gizmo.name || gizmo.title);
+        return id ? { id: String(id), title: String(title || id) } : null;
+    }
+
+    function normalizeConversationMeta(item) {
+        const value = item && (item.conversation || item);
+        if (!value) return null;
+        const id = value.id || value.conversation_id;
+        if (!id) return null;
+        return {
+            id: String(id),
+            title: value.title || 'Untitled Conversation',
+            updatedAt: value.update_time || value.updated_time || value.updated_at || value.update_at || value.create_time || 0
+        };
+    }
 
     async function getProjects(workspaceId) {
-        const r = await fetchWithRetry('/backend-api/gizmos/snorlax/sidebar', {
-            headers: buildHeaders(workspaceId)
-        });
-        if (!r.ok) return [];
-        const data = await r.json();
-        const projects = [];
-        data.items?.forEach(item => {
-            if (item?.gizmo?.id && item?.gizmo?.display?.name) {
-                projects.push({ id: item.gizmo.id, title: item.gizmo.display.name });
+        const headers = buildHeaders(workspaceId);
+        const projects = new Map();
+        const seenCursors = new Set();
+        let cursor = null;
+
+        while (true) {
+            const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+            const data = await requestJson(`/backend-api/gizmos/snorlax/sidebar${query}`, { headers }, '获取项目列表失败');
+            const items = data.items || data.gizmos || data.projects || [];
+            for (const item of items) {
+                const project = normalizeProject(item);
+                if (project) projects.set(project.id, project);
             }
-        });
-        return projects;
+            const nextCursor = data.next_cursor ?? data.cursor ?? null;
+            const hasMore = data.has_more ?? data.hasMore ?? Boolean(nextCursor);
+            if (!hasMore || !nextCursor || seenCursors.has(String(nextCursor))) break;
+            seenCursors.add(String(nextCursor));
+            cursor = String(nextCursor);
+        }
+        return Array.from(projects.values());
     }
 
-    /**
-     * 收集会话 meta 信息（ID + 更新时间 + source）
-     * 返回 { rootMeta, projectMeta }
-     *
-     * rootLimit：只作用于“根目录”，达到 N 条就提前停止继续扫描根目录历史；
-     * 项目部分无数量限制（如果 includeProjects）。
-     */
-    async function collectConversationsMeta(workspaceId, includeProjects, rootLimit = Infinity) {
-        const headers = buildHeaders(workspaceId);
-        const metaMap = new Map();
+    async function collectRootConversations(headers, rootLimit) {
+        const map = new Map();
+        const perBucketLimit = Number.isFinite(rootLimit) ? Math.max(1, rootLimit) : Infinity;
 
-        const upsert = meta => {
-            const existing = metaMap.get(meta.id);
-            if (!existing) {
-                metaMap.set(meta.id, meta);
-            } else if (meta.source === 'project' && existing.source !== 'project') {
-                metaMap.set(meta.id, { ...existing, ...meta });
-            }
-        };
-
-        const rootLimitEff =
-            Number.isFinite(rootLimit) && rootLimit > 0 ? rootLimit : Infinity;
-        let rootCount = 0;
-        let stopRootScan = false;
-
-        // 1) 根目录会话：Active + Archived
-        for (const is_archived of [false, true]) {
-            if (stopRootScan) break;
-
+        for (const isArchived of [false, true]) {
             let offset = 0;
-            let has_more = true;
-
-            while (has_more) {
-                if (rootCount >= rootLimitEff && rootLimitEff !== Infinity) {
-                    stopRootScan = true;
-                    break;
+            let bucketCount = 0;
+            while (true) {
+                const remaining = Number.isFinite(perBucketLimit) ? Math.max(1, perBucketLimit - bucketCount) : PAGE_LIMIT;
+                const pageLimit = Math.min(PAGE_LIMIT, remaining);
+                const url = `/backend-api/conversations?offset=${offset}&limit=${pageLimit}&order=updated${isArchived ? '&is_archived=true' : ''}`;
+                const data = await requestJson(url, { headers }, '列举项目外对话失败');
+                const items = data.items || [];
+                if (!items.length) break;
+                for (const item of items) {
+                    const meta = normalizeConversationMeta(item);
+                    if (!meta) continue;
+                    const existing = map.get(meta.id);
+                    if (!existing || meta.updatedAt > existing.updatedAt) map.set(meta.id, { ...meta, source: 'root', isArchived });
+                    bucketCount++;
                 }
-
-                const url = `/backend-api/conversations?offset=${offset}&limit=${PAGE_LIMIT}&order=updated${
-                    is_archived ? '&is_archived=true' : ''
-                }`;
-                const r = await fetchWithRetry(url, { headers });
-                if (!r.ok)
-                    throw new Error(`列举项目外对话列表失败 (${r.status})`);
-
-                const j = await r.json();
-                const items = j.items || [];
-                if (!items.length) {
-                    has_more = false;
-                    break;
-                }
-
-                for (const it of items) {
-                    if (!it || !it.id) continue;
-                    const updated =
-                        it.update_time ||
-                        it.updated_time ||
-                        it.updated_at ||
-                        it.update_at ||
-                        it.create_time ||
-                        0;
-                    upsert({
-                        id: it.id,
-                        updatedAt: updated || 0,
-                        source: 'root',
-                        isArchived: !!is_archived
-                    });
-                    rootCount++;
-                    if (rootCount >= rootLimitEff && rootLimitEff !== Infinity) {
-                        stopRootScan = true;
-                        break;
-                    }
-                }
-
-                if (stopRootScan) break;
-
-                has_more = items.length === PAGE_LIMIT;
                 offset += items.length;
-                await sleep(jitter());
+                if (Number.isFinite(perBucketLimit) && bucketCount >= perBucketLimit) break;
+                if (items.length < pageLimit) break;
             }
         }
 
-        // 2) 项目内会话：从第一页开始，兼容 cursor / next_cursor 两种响应字段。
-        if (includeProjects) {
-            const projects = await getProjects(workspaceId);
-            for (const project of projects) {
-                let cursor = null;
-                const seenCursors = new Set();
+        return Array.from(map.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    }
 
-                while (true) {
-                    const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
-                    const url = `/backend-api/gizmos/${project.id}/conversations${query}`;
-                    const r = await fetchWithRetry(url, { headers });
-                    if (!r.ok)
-                        throw new Error(`列举项目对话列表失败 (${r.status})`);
-                    const j = await r.json();
-                    const items = j.items || [];
+    async function fetchProjectConversationPage(projectId, cursor, headers) {
+        const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+        let response = await fetchWithRetry(`/backend-api/gizmos/${encodeURIComponent(projectId)}/conversations${query}`, { headers });
+        if (!cursor && !response.ok && [400, 422].includes(response.status)) {
+            response = await fetchWithRetry(`/backend-api/gizmos/${encodeURIComponent(projectId)}/conversations?cursor=0`, { headers });
+        }
+        if (!response.ok) {
+            const error = new Error(`列举项目对话失败 (${response.status})`);
+            error.status = response.status;
+            throw error;
+        }
+        return response.json();
+    }
 
-                    for (const it of items) {
-                        if (!it || !it.id) continue;
-                        const updated =
-                            it.update_time ||
-                            it.updated_time ||
-                            it.updated_at ||
-                            it.update_at ||
-                            it.create_time ||
-                            0;
-                        upsert({
-                            id: it.id,
-                            updatedAt: updated || 0,
-                            source: 'project',
-                            projectId: project.id,
-                            projectTitle: project.title
-                        });
-                    }
-
-                    const nextCursor = j.next_cursor ?? j.cursor ?? null;
-                    const hasMore = j.has_more ?? j.hasMore ?? Boolean(nextCursor);
-                    if (!hasMore || !nextCursor || seenCursors.has(String(nextCursor))) break;
-                    seenCursors.add(String(nextCursor));
-                    cursor = String(nextCursor);
-                    await sleep(jitter());
+    async function collectProjectConversations(headers, workspaceId) {
+        const map = new Map();
+        const projects = await getProjects(workspaceId);
+        for (const project of projects) {
+            let cursor = null;
+            const seenCursors = new Set();
+            while (true) {
+                const data = await fetchProjectConversationPage(project.id, cursor, headers);
+                const items = data.items || data.conversations || [];
+                for (const item of items) {
+                    const meta = normalizeConversationMeta(item);
+                    if (!meta) continue;
+                    map.set(meta.id, { ...meta, source: 'project', projectId: project.id, projectTitle: project.title });
                 }
+                const nextCursor = data.next_cursor ?? data.cursor ?? null;
+                const hasMore = data.has_more ?? data.hasMore ?? Boolean(nextCursor);
+                if (!hasMore || !nextCursor || seenCursors.has(String(nextCursor))) break;
+                seenCursors.add(String(nextCursor));
+                cursor = String(nextCursor);
             }
         }
+        return Array.from(map.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    }
 
-        const all = Array.from(metaMap.values());
-        const rootMeta = all.filter(m => m.source === 'root');
-        const projectMeta = all.filter(m => m.source === 'project');
-        return { rootMeta, projectMeta };
+    async function collectConversationsMeta(workspaceId, includeProjects, rootLimit) {
+        const headers = buildHeaders(workspaceId);
+        const rootAll = await collectRootConversations(headers, rootLimit);
+        const rootMeta = Number.isFinite(rootLimit) ? rootAll.slice(0, rootLimit) : rootAll;
+        const projectMeta = includeProjects ? await collectProjectConversations(headers, workspaceId) : [];
+
+        const projectIds = new Set(projectMeta.map(item => item.id));
+        return {
+            rootMeta: rootMeta.filter(item => !projectIds.has(item.id)),
+            projectMeta
+        };
     }
 
     async function getConversation(id, workspaceId) {
         const headers = buildHeaders(workspaceId);
-        const r = await fetchWithRetry(`/backend-api/conversation/${id}`, { headers });
-        if (r.status === 404 || r.status === 403) return null;
-        if (!r.ok) return null;
-        let j;
-        try {
-            j = await r.json();
-        } catch (e) {
-            return null;
-        }
-        if (!j || !j.mapping) return null;
-        return j;
+        return requestJson(`/backend-api/conversation/${encodeURIComponent(id)}`, { headers }, `获取对话 ${id} 失败`);
     }
 
     function detectAllWorkspaceIds() {
-        const foundIds = new Set(capturedWorkspaceIds);
+        const ids = new Set(capturedWorkspaceIds);
         try {
-            const data = JSON.parse(
-                document.getElementById('__NEXT_DATA__')?.textContent || '{}'
-            );
+            const node = document.getElementById('__NEXT_DATA__');
+            const data = node ? JSON.parse(node.textContent || '{}') : {};
             const accounts = data?.props?.pageProps?.user?.accounts;
-            if (accounts) {
-                Object.values(accounts).forEach(acc => {
-                    if (acc?.account?.id) foundIds.add(acc.account.id);
-                });
-            }
-        } catch (e) {}
-        return Array.from(foundIds);
+            if (accounts) Object.values(accounts).forEach(account => {
+                const id = account?.account?.id || account?.id;
+                if (id) ids.add(String(id));
+            });
+        } catch (_) {}
+        return Array.from(ids);
     }
 
-    // ==========================================
-    // 6. 导出流程：按钮内嵌进度条 + 状态文本
-    // ==========================================
+    function downloadFile(blob, filename) {
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = filename;
+        anchor.rel = 'noopener';
+        anchor.style.display = 'none';
+        document.body.appendChild(anchor);
+        anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+    }
+
+    function buildExportReport(version, total, exported, failures) {
+        return {
+            exporter: 'ChatGPT Universal Exporter Enhanced Beta',
+            version,
+            generatedAt: new Date().toISOString(),
+            totalRequested: total,
+            exported,
+            failed: failures.length,
+            failures
+        };
+    }
 
     async function startExportProcess(mode, workspaceId, formats, limit = Infinity, includeProjects = true) {
-        const btn = document.getElementById('gpt-rescue-btn');
-        if (!btn) return;
+        const button = document.getElementById('gpt-rescue-btn');
+        if (!button) return;
+        const icon = button.querySelector('.btn-icon');
+        const label = button.querySelector('.btn-label');
+        const originalLabel = label ? label.textContent : 'Export';
 
-        const iconSpan = btn.querySelector('.btn-icon');
-        const labelSpan = btn.querySelector('.btn-label');
-
-        const originalLabelText = labelSpan ? labelSpan.textContent : '';
-        const resetProgress = () => btn.style.setProperty('--prog', '0%');
-
-        const setIcon = type => {
-            if (!iconSpan) return;
-            btn.classList.remove('ue-loading', 'ue-error', 'ue-done');
-            switch (type) {
-                case 'spinner':
-                    iconSpan.innerHTML = ICON_SPINNER;
-                    btn.classList.add('ue-loading');
-                    break;
-                case 'check':
-                    iconSpan.innerHTML = ICON_CHECK;
-                    btn.classList.add('ue-done');
-                    break;
-                case 'error':
-                    iconSpan.innerHTML = ICON_ERROR;
-                    btn.classList.add('ue-error');
-                    break;
-                default:
-                    iconSpan.innerHTML = ICON_DOWNLOAD;
-                    break;
+        const setState = (kind, text, percent) => {
+            button.classList.remove('ue-loading', 'ue-error', 'ue-done');
+            if (icon) {
+                icon.innerHTML = kind === 'loading' ? ICON_SPINNER : kind === 'done' ? ICON_CHECK : kind === 'error' ? ICON_ERROR : ICON_DOWNLOAD;
             }
+            if (kind === 'loading') button.classList.add('ue-loading');
+            if (kind === 'done') button.classList.add('ue-done');
+            if (kind === 'error') button.classList.add('ue-error');
+            if (label) label.textContent = text;
+            button.style.setProperty('--prog', `${Math.max(0, Math.min(100, percent || 0))}%`);
         };
 
-        const setLabel = text => {
-            if (labelSpan && typeof text === 'string') {
-                labelSpan.textContent = text;
-            }
-        };
-
-        const setProgress = percent => {
-            if (percent == null || isNaN(percent)) return;
-            const clamped = Math.max(0, Math.min(100, percent));
-            btn.style.setProperty('--prog', clamped + '%');
-        };
-
-        btn.disabled = true;
-
+        button.disabled = true;
         try {
-            const token = await ensureAccessToken();
-            if (!token) {
-                btn.disabled = false;
-                setIcon('error');
-                setLabel('失败');
-                setProgress(0);
-                return;
-            }
+            if (!await ensureAccessToken()) return;
+            adaptiveDelay = BASE_DELAY;
+            nextRequestAt = 0;
+            setState('loading', '扫描中…', 3);
 
-            setIcon('spinner');
-            setLabel('扫描中...');
-            setProgress(5);
-
-            const { rootMeta, projectMeta } = await collectConversationsMeta(
-                workspaceId,
-                includeProjects,
-                limit
-            );
-
-            if (!rootMeta.length && !projectMeta.length) {
-                alert('未找到任何会话记录。');
-                setIcon('error');
-                setLabel('无会话');
-                setProgress(0);
-                return;
-            }
-
-            rootMeta.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-            projectMeta.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-
-            const selectedRoot =
-                limit === Infinity ? rootMeta : rootMeta.slice(0, limit);
-            const exportMetaList = selectedRoot.concat(projectMeta);
-            const total = exportMetaList.length;
-
-            if (!total) {
-                alert('未找到符合条件的会话。');
-                setIcon('error');
-                setLabel('空结果');
-                setProgress(0);
-                return;
-            }
-
-            setProgress(0);
-            setLabel(`0/${total}`);
+            const { rootMeta, projectMeta } = await collectConversationsMeta(workspaceId, includeProjects, limit);
+            const exportList = rootMeta.concat(projectMeta);
+            if (!exportList.length) throw new Error('未找到符合条件的会话。');
 
             const zip = new JSZip();
-            let processed = 0;
+            const failures = [];
+            let exported = 0;
 
-            for (const meta of exportMetaList) {
-                processed++;
-                const percent = (processed / total) * 100;
-                setProgress(percent);
-                setLabel(`${processed}/${total}`);
-
-                const convData = await getConversation(meta.id, workspaceId);
-                if (!convData) {
-                    await sleep(jitter());
-                    continue;
+            for (let index = 0; index < exportList.length; index++) {
+                const meta = exportList[index];
+                const percent = 5 + ((index + 1) / exportList.length) * 86;
+                setState('loading', `${index + 1}/${exportList.length}`, percent);
+                try {
+                    const convData = await getConversation(meta.id, workspaceId);
+                    if (!convData || !convData.mapping) throw new Error('对话数据缺少 mapping');
+                    const folder = meta.source === 'project' && meta.projectTitle ? zip.folder(sanitizeFilename(meta.projectTitle)) : zip;
+                    if (formats.json) folder.file(generateUniqueFilename(convData, 'json'), JSON.stringify(convData, null, 2));
+                    if (formats.markdown) folder.file(generateUniqueFilename(convData, 'md'), convertToMarkdown(convData));
+                    if (formats.html) folder.file(generateUniqueFilename(convData, 'html'), convertToHTML(convData));
+                    exported++;
+                } catch (error) {
+                    console.warn('[ChatGPT Exporter] skipped conversation', meta.id, error);
+                    failures.push({
+                        id: meta.id,
+                        title: meta.title || '',
+                        source: meta.source,
+                        project: meta.projectTitle || null,
+                        reason: error && error.message ? error.message : String(error)
+                    });
                 }
-
-                const folder =
-                    meta.source === 'project' && meta.projectTitle
-                        ? zip.folder(sanitizeFilename(meta.projectTitle))
-                        : zip;
-
-                if (formats.json)
-                    folder.file(
-                        generateUniqueFilename(convData, 'json'),
-                        JSON.stringify(convData, null, 2)
-                    );
-                if (formats.markdown)
-                    folder.file(
-                        generateUniqueFilename(convData, 'md'),
-                        convertToMarkdown(convData)
-                    );
-                if (formats.html)
-                    folder.file(
-                        generateUniqueFilename(convData, 'html'),
-                        convertToHTML(convData)
-                    );
-
-                await sleep(jitter());
             }
 
-            setIcon('spinner');
-            setLabel('打包...');
-            setProgress(95);
+            const report = buildExportReport(VERSION, exportList.length, exported, failures);
+            zip.file('_export-report.json', JSON.stringify(report, null, 2));
+            zip.file('_export-report.txt', [
+                `ChatGPT Exporter ${VERSION}`,
+                `Requested: ${report.totalRequested}`,
+                `Exported: ${report.exported}`,
+                `Failed: ${report.failed}`,
+                '',
+                ...failures.map(item => `- ${item.id}${item.title ? ` | ${item.title}` : ''}: ${item.reason}`)
+            ].join('\n'));
 
-            const blob = await zip.generateAsync({
-                type: 'blob',
-                compression: 'DEFLATE'
-            });
+            setState('loading', '打包…', 94);
+            const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
             const date = new Date().toISOString().slice(0, 10);
-            const suffix =
-                limit === Infinity ? 'full' : `recentRoot_${selectedRoot.length}`;
-            const projFlag = includeProjects ? 'with_projects' : 'no_projects';
-            const filename =
-                mode === 'team'
-                    ? `chatgpt_team_backup_${workspaceId || 'workspace'}_${date}_${suffix}_${projFlag}.zip`
-                    : `chatgpt_personal_backup_${date}_${suffix}_${projFlag}.zip`;
-
+            const rootSuffix = Number.isFinite(limit) ? `recentRoot_${rootMeta.length}` : 'full';
+            const projectSuffix = includeProjects ? 'with_projects' : 'no_projects';
+            const filename = mode === 'team'
+                ? `chatgpt_team_backup_${sanitizeFilename(workspaceId || 'workspace')}_${date}_${rootSuffix}_${projectSuffix}.zip`
+                : `chatgpt_personal_backup_${date}_${rootSuffix}_${projectSuffix}.zip`;
             downloadFile(blob, filename);
 
-            setIcon('check');
-            setLabel('完成');
-            setProgress(100);
-            alert('✅ 导出完成！');
-        } catch (e) {
-            console.error('导出错误', e);
-            setIcon('error');
-            setLabel('错误');
-            setProgress(0);
-            alert(`导出失败: ${e.message}`);
+            if (failures.length) {
+                setState('done', `完成 ${exported}/${exportList.length}`, 100);
+                alert(`导出完成：成功 ${exported} 条，失败 ${failures.length} 条。ZIP 内的 _export-report.txt / .json 记录了失败明细。`);
+            } else {
+                setState('done', '完成', 100);
+                alert(`✅ 导出完成，共 ${exported} 条会话。`);
+            }
+        } catch (error) {
+            console.error('[ChatGPT Exporter] export failed', error);
+            setState('error', '错误', 0);
+            alert(`导出失败：${error && error.message ? error.message : error}`);
         } finally {
             setTimeout(() => {
-                btn.disabled = false;
-                setIcon('download');
-                setLabel(originalLabelText || 'Export');
-                resetProgress();
-            }, 2500);
+                button.disabled = false;
+                setState('idle', originalLabel || 'Export', 0);
+            }, 2800);
         }
     }
 
-    // ==========================================
-    // 7. UI：样式注入 + 弹窗 + 按钮
-    // ==========================================
-
     function injectStyles() {
-        const styleId = 'gpt-exporter-styles';
-        if (document.getElementById(styleId)) return;
-
-        const css = `
-            :root {
-                --ue-primary: #10a37f;
-                --ue-primary-hover: #0d8a6c;
-                --ue-primary-dark: #0b745c;
-                --ue-bg: #ffffff;
-                --ue-text: #343541;
-                --ue-text-secondary: #6e6e80;
-                --ue-border: #ececf1;
-                --ue-shadow: 0 10px 30px rgba(0,0,0,0.2);
-                --ue-radius: 12px;
-                --ue-overlay-bg: rgba(52, 53, 65, 0.7);
-            }
-            
-            #gpt-rescue-btn {
-                --prog: 0%;
-                position: fixed; bottom: 24px; right: 24px; z-index: 99997;
-                height: 50px; min-width: 64px; padding: 0 16px;
-                border-radius: 25px; border: none;
-                cursor: pointer;
-                display: inline-flex; align-items: center; justify-content: center;
-                gap: 6px;
-                font-weight: 600; font-size: 14px; white-space: nowrap;
-                color: #ffffff;
-                background-image: linear-gradient(
-                    to right,
-                    var(--ue-primary-dark) 0%,
-                    var(--ue-primary-dark) var(--prog),
-                    var(--ue-primary) var(--prog),
-                    var(--ue-primary) 100%
-                );
-                background-color: var(--ue-primary);
-                box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-                transition: transform 0.2s ease, box-shadow 0.2s ease, background-image 0.2s ease;
-            }
-            #gpt-rescue-btn:hover {
-                transform: translateY(-1px) scale(1.03);
-                box-shadow: 0 8px 16px rgba(0,0,0,0.25);
-            }
-            #gpt-rescue-btn:disabled {
-                opacity: 0.85;
-                cursor: default;
-            }
-            #gpt-rescue-btn .btn-icon {
-                display: inline-flex;
-            }
-            #gpt-rescue-btn .btn-icon svg {
-                width: 20px;
-                height: 20px;
-                fill: currentColor;
-            }
-            #gpt-rescue-btn .btn-label {
-                font-variant-numeric: tabular-nums;
-            }
-            #gpt-rescue-btn.ue-loading .btn-icon svg {
-                animation: ue-spin 0.9s linear infinite;
-                transform-origin: 50% 50%;
-            }
-
-            #export-dialog-overlay {
-                position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-                background: var(--ue-overlay-bg); backdrop-filter: blur(4px); z-index: 99998;
-                display: flex; align-items: center; justify-content: center;
-                opacity: 0; transition: opacity 0.3s ease;
-            }
-            #export-dialog-overlay.visible { opacity: 1; }
-            .ue-dialog {
-                background: var(--ue-bg); width: 420px; max-width: 90%;
-                border-radius: var(--ue-radius); box-shadow: var(--ue-shadow); padding: 24px;
-                font-family: system-ui, -apple-system, sans-serif; color: var(--ue-text);
-                transform: translateY(20px); transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
-            }
-            #export-dialog-overlay.visible .ue-dialog { transform: translateY(0); }
-
-            .ue-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; border-bottom: 1px solid var(--ue-border); padding-bottom: 12px; }
-            .ue-header h2 { margin: 0; font-size: 18px; font-weight: 600; }
-            .ue-close { cursor: pointer; opacity: 0.5; transition: 0.2s; background:none; border:none; font-size: 20px; color: var(--ue-text);}
-            .ue-close:hover { opacity: 1; }
-
-            .ue-tabs { display: flex; background: #f0f0f1; padding: 4px; border-radius: 8px; margin-bottom: 20px; }
-            .ue-tab { flex: 1; text-align: center; padding: 8px; font-size: 14px; cursor: pointer; border-radius: 6px; transition: 0.2s; color: var(--ue-text-secondary); }
-            .ue-tab.active { background: #fff; color: var(--ue-text); font-weight: 600; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-
-            .ue-formats { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 16px; }
-            .ue-format-item { display: flex; flex-direction: column; align-items: center; padding: 12px; border: 1px solid var(--ue-border); border-radius: 8px; cursor: pointer; transition: 0.2s; }
-            .ue-format-item:hover { background: #f7f7f8; }
-            .ue-format-item.active { border-color: var(--ue-primary); background: rgba(16, 163, 127, 0.05); color: var(--ue-primary); font-weight: bold; }
-            .ue-format-item input { display: none; }
-            .ue-icon { font-size: 24px; margin-bottom: 4px; }
-
-            .ue-range-wrapper { margin-bottom: 8px; }
-            .ue-range-selector { display: flex; align-items: center; gap: 15px; background: #f9f9f9; padding: 10px; border-radius: 8px; border: 1px solid var(--ue-border); }
-            .ue-radio-label { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 14px; color: var(--ue-text); user-select: none; }
-            .ue-range-input { width: 60px; padding: 4px 8px; border-radius: 4px; border: 1px solid #ccc; font-size: 14px; outline: none; transition: 0.2s; }
-            .ue-range-input:disabled { background: #eef; color: #999; border-color: #eee; cursor: not-allowed; }
-            .ue-range-input:focus { border-color: var(--ue-primary); box-shadow: 0 0 0 2px rgba(16,163,127,0.1); }
-
-            .ue-checkbox-line { margin-bottom: 10px; font-size: 13px; color:#555; display:flex; align-items:center; gap:6px; }
-            .ue-checkbox-line input { cursor:pointer; }
-
-            .ue-input-group { margin-top: 12px; display: none; }
-            .ue-input-group.show { display: block; animation: fadeIn 0.3s; }
-            .ue-input { width: 100%; padding: 10px 12px; border: 1px solid var(--ue-border); border-radius: 6px; font-size: 14px; outline: none; box-sizing: border-box; }
-            .ue-input:focus { border-color: var(--ue-primary); }
-            .ue-hint { font-size: 12px; color: var(--ue-text-secondary); margin-top: 4px; }
-
-            .ue-footer { margin-top: 24px; display: flex; justify-content: flex-end; gap: 12px; }
-            .ue-btn { padding: 10px 20px; border-radius: 6px; font-size: 14px; font-weight: 500; cursor: pointer; border: none; transition: 0.2s; }
-            .ue-btn-cancel { background: transparent; color: var(--ue-text-secondary); }
-            .ue-btn-cancel:hover { background: #f0f0f1; color: var(--ue-text); }
-            .ue-btn-primary { background: var(--ue-primary); color: white; }
-            .ue-btn-primary:hover { background: var(--ue-primary-hover); }
-
-            @keyframes fadeIn { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: translateY(0); } }
-            @keyframes ue-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-        `;
+        if (document.getElementById('gpt-exporter-styles')) return;
         const style = document.createElement('style');
-        style.id = styleId;
-        style.textContent = css;
-        document.head.appendChild(style);
+        style.id = 'gpt-exporter-styles';
+        style.textContent = `
+:root{--ue-primary:#10a37f;--ue-primary-dark:#0b745c;--ue-bg:#fff;--ue-text:#343541;--ue-muted:#6e6e80;--ue-border:#dedee5;--ue-overlay:rgba(20,20,22,.64)}
+#gpt-rescue-btn{--prog:0%;position:fixed;right:24px;bottom:24px;z-index:99997;height:48px;min-width:68px;padding:0 16px;border:0;border-radius:24px;color:#fff;background:linear-gradient(to right,var(--ue-primary-dark) 0,var(--ue-primary-dark) var(--prog),var(--ue-primary) var(--prog),var(--ue-primary) 100%);box-shadow:0 5px 18px rgba(0,0,0,.2);display:flex;align-items:center;justify-content:center;gap:7px;font:600 14px system-ui,-apple-system,sans-serif;cursor:pointer}#gpt-rescue-btn:disabled{opacity:.82;cursor:default}#gpt-rescue-btn .btn-icon{display:flex}#gpt-rescue-btn svg{width:20px;height:20px;fill:currentColor}#gpt-rescue-btn.ue-loading svg{animation:ue-spin .9s linear infinite}
+#export-dialog-overlay{position:fixed;inset:0;z-index:99998;background:var(--ue-overlay);backdrop-filter:blur(3px);display:flex;align-items:center;justify-content:center;padding:18px}.ue-dialog{width:440px;max-width:100%;max-height:92vh;overflow:auto;background:var(--ue-bg);color:var(--ue-text);border-radius:12px;padding:22px;box-shadow:0 18px 50px rgba(0,0,0,.28);font-family:system-ui,-apple-system,sans-serif}.ue-header{display:flex;align-items:center;justify-content:space-between;padding-bottom:12px;margin-bottom:16px;border-bottom:1px solid var(--ue-border)}.ue-header h2{font-size:18px;margin:0}.ue-close{border:0;background:transparent;font-size:21px;color:inherit;cursor:pointer}.ue-tabs{display:flex;background:#f0f0f2;padding:4px;border-radius:8px;margin-bottom:16px}.ue-tab{flex:1;text-align:center;padding:8px;border-radius:6px;cursor:pointer;color:var(--ue-muted);font-size:14px}.ue-tab.active{background:#fff;color:var(--ue-text);font-weight:600;box-shadow:0 1px 4px rgba(0,0,0,.08)}.ue-label{font-size:13px;color:var(--ue-muted);margin:12px 0 6px}.ue-range{display:flex;gap:15px;align-items:center;padding:10px;background:#f8f8f9;border:1px solid var(--ue-border);border-radius:8px}.ue-range label,.ue-check{font-size:13px;display:flex;align-items:center;gap:6px}.ue-range input[type=number]{width:70px;padding:5px 7px;border:1px solid #cfcfd5;border-radius:5px}.ue-hint{margin-top:6px;color:var(--ue-muted);font-size:12px;line-height:1.45}.ue-check{margin:11px 0}.ue-formats{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}.ue-format{padding:10px;border:1px solid var(--ue-border);border-radius:8px;text-align:center;cursor:pointer;font-size:13px}.ue-format.active{border-color:var(--ue-primary);background:rgba(16,163,127,.06);color:var(--ue-primary);font-weight:600}.ue-format input{display:none}.ue-team{display:none;margin-top:12px}.ue-team.show{display:block}.ue-input{width:100%;padding:9px 10px;border:1px solid var(--ue-border);border-radius:7px;font-size:13px}.ue-footer{display:flex;justify-content:flex-end;gap:10px;margin-top:20px}.ue-btn{border:0;border-radius:7px;padding:9px 16px;font-size:13px;cursor:pointer}.ue-btn.cancel{background:#f0f0f2;color:var(--ue-text)}.ue-btn.primary{background:var(--ue-primary);color:#fff}@keyframes ue-spin{to{transform:rotate(360deg)}}
+@media(prefers-color-scheme:dark){:root{--ue-bg:#242424;--ue-text:#eee;--ue-muted:#aaa;--ue-border:#444}.ue-tabs,.ue-range,.ue-btn.cancel{background:#303030}.ue-tab.active{background:#3a3a3a}.ue-input{background:#202020;color:#eee;border-color:#555}}
+`;
+        (document.head || document.documentElement).appendChild(style);
     }
 
     function showExportDialog() {
         if (document.getElementById('export-dialog-overlay')) return;
         injectStyles();
-
+        const ids = detectAllWorkspaceIds();
         const overlay = document.createElement('div');
         overlay.id = 'export-dialog-overlay';
-
-        const ids = detectAllWorkspaceIds();
-        const detectedText = ids.length ? ids.join(', ') : '暂未检测到';
-
-        overlay.innerHTML = `
-            <div class="ue-dialog">
-                <div class="ue-header">
-                    <h2>导出对话记录</h2>
-                    <button class="ue-close">✕</button>
-                </div>
-                
-                <div class="ue-tabs">
-                    <div class="ue-tab active" data-mode="personal">👤 个人空间</div>
-                    <div class="ue-tab" data-mode="team">🏢 团队空间</div>
-                </div>
-                
-                <div style="font-size:13px; color:#666; margin-bottom:6px;">导出范围:</div>
-                <div class="ue-range-wrapper">
-                    <div class="ue-range-selector">
-                        <label class="ue-radio-label">
-                            <input type="radio" name="ue-range" value="all" checked> 全部
-                        </label>
-                        <label class="ue-radio-label">
-                            <input type="radio" name="ue-range" value="recent">
-                            最近 <input type="number" id="ue-range-count" value="20" min="1" max="9999" disabled class="ue-range-input"> 条
-                        </label>
-                    </div>
-                    <div class="ue-hint">
-                        提示：“最近 N 条” 仅限制<b>根目录</b>对话；若勾选项目，项目文件将<b>全部导出</b>。
-                    </div>
-                </div>
-
-                <div class="ue-checkbox-line">
-                    <input type="checkbox" id="ue-include-projects" checked>
-                    <label for="ue-include-projects">是否导出项目文件</label>
-                </div>
-
-                <div style="font-size:13px; color:#666; margin-bottom:8px;">导出格式:</div>
-                <div class="ue-formats">
-                    <div class="ue-format-item active" data-fmt="json">
-                        <div class="ue-icon">{ }</div><span>JSON</span>
-                        <input type="checkbox" id="fmt-json" checked>
-                    </div>
-                    <div class="ue-format-item active" data-fmt="markdown">
-                        <div class="ue-icon">⬇️</div><span>Markdown</span>
-                        <input type="checkbox" id="fmt-md" checked>
-                    </div>
-                    <div class="ue-format-item active" data-fmt="html">
-                        <div class="ue-icon">🌐</div><span>HTML</span>
-                        <input type="checkbox" id="fmt-html" checked>
-                    </div>
-                </div>
-
-                <div id="team-area" class="ue-input-group">
-                    <input type="text" id="team-id" class="ue-input" placeholder="输入 Team Workspace ID (ws-...)">
-                    <div class="ue-hint">自动检测: ${detectedText}</div>
-                </div>
-                
-                <div class="ue-footer">
-                    <button id="dlg-cancel" class="ue-btn ue-btn-cancel">取消</button>
-                    <button id="dlg-start" class="ue-btn ue-btn-primary">开始导出</button>
-                </div>
-            </div>
-        `;
-
+        overlay.innerHTML = `<div class="ue-dialog"><div class="ue-header"><h2>导出对话记录 <small style="font-size:11px;color:var(--ue-muted)">${VERSION}</small></h2><button class="ue-close">✕</button></div><div class="ue-tabs"><div class="ue-tab active" data-mode="personal">👤 个人空间</div><div class="ue-tab" data-mode="team">🏢 团队空间</div></div><div class="ue-label">导出范围</div><div class="ue-range"><label><input type="radio" name="ue-range" value="all" checked> 全部</label><label><input type="radio" name="ue-range" value="recent"> 最近 <input id="ue-range-count" type="number" value="20" min="1" max="9999" disabled> 条</label></div><div class="ue-hint">“最近 N 条”只限制根目录；项目会话在勾选后仍按项目完整导出。</div><label class="ue-check"><input type="checkbox" id="ue-projects" checked> 导出 Projects / Gizmos 会话</label><div class="ue-label">导出格式</div><div class="ue-formats"><label class="ue-format active">JSON<input id="fmt-json" type="checkbox" checked></label><label class="ue-format active">Markdown<input id="fmt-md" type="checkbox" checked></label><label class="ue-format active">HTML<input id="fmt-html" type="checkbox" checked></label></div><div id="ue-team" class="ue-team"><input id="ue-team-id" class="ue-input" placeholder="Workspace ID (ws-...)"><div class="ue-hint">自动检测：${escapeHtml(ids.length ? ids.join(', ') : '暂未检测到')}</div></div><div class="ue-hint">大批量导出会自动降速，并在 429/服务器错误时退避重试。单条失败不会中断整个 ZIP。</div><div class="ue-footer"><button class="ue-btn cancel" id="ue-cancel">取消</button><button class="ue-btn primary" id="ue-start">开始导出</button></div></div>`;
         document.body.appendChild(overlay);
-        requestAnimationFrame(() => overlay.classList.add('visible'));
 
-        const close = () => {
-            overlay.classList.remove('visible');
-            setTimeout(() => overlay.remove(), 300);
-        };
+        const close = () => overlay.remove();
         overlay.querySelector('.ue-close').onclick = close;
-        overlay.querySelector('#dlg-cancel').onclick = close;
-        overlay.onclick = e => {
-            if (e.target === overlay) close();
-        };
+        overlay.querySelector('#ue-cancel').onclick = close;
+        overlay.onclick = event => { if (event.target === overlay) close(); };
 
-        const rangeRadios = overlay.querySelectorAll('input[name="ue-range"]');
-        const rangeCountInput = overlay.querySelector('#ue-range-count');
-        rangeRadios.forEach(radio => {
-            radio.onchange = () => {
-                if (radio.value === 'recent') {
-                    rangeCountInput.disabled = false;
-                    rangeCountInput.focus();
-                } else {
-                    rangeCountInput.disabled = true;
-                }
-            };
+        const count = overlay.querySelector('#ue-range-count');
+        overlay.querySelectorAll('input[name="ue-range"]').forEach(radio => {
+            radio.onchange = () => { count.disabled = radio.value !== 'recent' || !radio.checked; };
         });
 
-        const fmtItems = overlay.querySelectorAll('.ue-format-item');
-        fmtItems.forEach(item => {
-            item.onclick = () => {
-                const cb = item.querySelector('input');
-                cb.checked = !cb.checked;
-                item.classList.toggle('active', cb.checked);
+        overlay.querySelectorAll('.ue-format').forEach(label => {
+            label.onclick = event => {
+                if (event.target.tagName === 'INPUT') return;
+                const checkbox = label.querySelector('input');
+                checkbox.checked = !checkbox.checked;
+                label.classList.toggle('active', checkbox.checked);
+                event.preventDefault();
             };
+            label.querySelector('input').onchange = event => label.classList.toggle('active', event.target.checked);
         });
 
         const tabs = overlay.querySelectorAll('.ue-tab');
-        const teamArea = overlay.querySelector('#team-area');
-        let currentMode = 'personal';
-        tabs.forEach(tab => {
-            tab.onclick = () => {
-                tabs.forEach(t => t.classList.remove('active'));
-                tab.classList.add('active');
-                currentMode = tab.dataset.mode;
-                if (currentMode === 'team') {
-                    teamArea.classList.add('show');
-                    const teamInput = overlay.querySelector('#team-id');
-                    if (ids.length > 0 && !teamInput.value) teamInput.value = ids[0];
-                } else {
-                    teamArea.classList.remove('show');
-                }
-            };
+        const teamArea = overlay.querySelector('#ue-team');
+        const teamInput = overlay.querySelector('#ue-team-id');
+        let mode = 'personal';
+        tabs.forEach(tab => tab.onclick = () => {
+            tabs.forEach(item => item.classList.remove('active'));
+            tab.classList.add('active');
+            mode = tab.dataset.mode;
+            teamArea.classList.toggle('show', mode === 'team');
+            if (mode === 'team' && ids.length && !teamInput.value) teamInput.value = ids[0];
         });
 
-        overlay.querySelector('#dlg-start').onclick = async () => {
+        overlay.querySelector('#ue-start').onclick = async () => {
             const formats = {
                 json: overlay.querySelector('#fmt-json').checked,
                 markdown: overlay.querySelector('#fmt-md').checked,
                 html: overlay.querySelector('#fmt-html').checked
             };
-            if (!Object.values(formats).includes(true)) {
-                alert('请至少选择一种导出格式！');
-                return;
-            }
+            if (!Object.values(formats).some(Boolean)) return alert('请至少选择一种导出格式。');
 
             let workspaceId = null;
-            if (currentMode === 'team') {
-                workspaceId = overlay.querySelector('#team-id').value.trim();
-                if (!workspaceId) {
-                    alert('请输入 Workspace ID');
-                    return;
-                }
+            if (mode === 'team') {
+                workspaceId = teamInput.value.trim();
+                if (!workspaceId) return alert('请输入 Workspace ID。');
             }
 
-            const rangeValue = overlay.querySelector(
-                'input[name="ue-range"]:checked'
-            ).value;
+            const range = overlay.querySelector('input[name="ue-range"]:checked').value;
             let limit = Infinity;
-            if (rangeValue === 'recent') {
-                const val = parseInt(rangeCountInput.value, 10);
-                if (!val || val <= 0) {
-                    alert('请输入有效的数量');
-                    return;
-                }
-                limit = val;
+            if (range === 'recent') {
+                limit = parseInt(count.value, 10);
+                if (!Number.isFinite(limit) || limit <= 0) return alert('请输入有效的最近条数。');
             }
-
-            const includeProjects = overlay.querySelector('#ue-include-projects').checked;
-
+            const includeProjects = overlay.querySelector('#ue-projects').checked;
             close();
-            exportFormats.mode = currentMode;
-            exportFormats.workspaceId = workspaceId;
-            await startExportProcess(currentMode, workspaceId, formats, limit, includeProjects);
+            await startExportProcess(mode, workspaceId, formats, limit, includeProjects);
         };
     }
 
-    function addBtn() {
-        if (document.getElementById('gpt-rescue-btn')) return;
+    function ensureButton() {
+        if (!document.body || document.getElementById('gpt-rescue-btn')) return;
         injectStyles();
-        const b = document.createElement('button');
-        b.id = 'gpt-rescue-btn';
-        b.title = 'Export Conversations';
-        b.style.setProperty('--prog', '0%');
-        b.innerHTML = `
-            <span class="btn-icon">${ICON_DOWNLOAD}</span>
-            <span class="btn-label">Export</span>
-        `;
-        b.onclick = showExportDialog;
-        document.body.appendChild(b);
+        const button = document.createElement('button');
+        button.id = 'gpt-rescue-btn';
+        button.title = `ChatGPT Exporter Beta ${VERSION}`;
+        button.innerHTML = `<span class="btn-icon">${ICON_DOWNLOAD}</span><span class="btn-label">Export</span>`;
+        button.onclick = showExportDialog;
+        document.body.appendChild(button);
     }
 
-    setTimeout(addBtn, 2000);
+    const observer = new MutationObserver(ensureButton);
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ensureButton, { once: true });
+    else ensureButton();
+    setInterval(ensureButton, 5000);
 })();
