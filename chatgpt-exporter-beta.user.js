@@ -1,5 +1,6 @@
 // ==UserScript==
 // @name         ChatGPT Universal Exporter Enhanced Beta
+// @version      1.1.0-beta.1
 // @description  Robust ZIP exporter with JSON/Markdown/HTML, safer intercept, full-thread export, and retries.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -16,9 +17,12 @@
     // 1. 核心配置 Core Config
     // ==========================================
 
-    const BASE_DELAY = 150;
-    const JITTER = 100;
+    // Conservatively pace backend requests. Large exports are especially prone to 429s.
+    const BASE_DELAY = 650;
+    const JITTER = 350;
     const PAGE_LIMIT = 100;
+    const RETRY_BASE_DELAY = 2000;
+    const MAX_RETRY_DELAY = 30000;
     let accessToken = null;
     let capturedWorkspaceIds = new Set();
 
@@ -174,21 +178,39 @@
         return match ? match[1] : null;
     }
 
-    async function fetchWithRetry(input, init = {}, retries = 3) {
+    function getRetryAfterMs(res) {
+        const raw = res && res.headers && res.headers.get('Retry-After');
+        if (!raw) return 0;
+        const seconds = Number(raw);
+        if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+        const dateMs = Date.parse(raw);
+        return Number.isFinite(dateMs) ? Math.max(0, dateMs - Date.now()) : 0;
+    }
+
+    async function fetchWithRetry(input, init = {}, retries = 5) {
         let attempt = 0;
         while (true) {
             try {
                 const res = await fetch(input, init);
                 if (res.ok) return res;
                 if (attempt < retries && (res.status === 429 || res.status >= 500)) {
-                    await sleep(BASE_DELAY * Math.pow(2, attempt) + Math.random() * JITTER);
+                    const retryAfter = getRetryAfterMs(res);
+                    const backoff = Math.min(
+                        MAX_RETRY_DELAY,
+                        RETRY_BASE_DELAY * Math.pow(2, attempt) + Math.random() * JITTER
+                    );
+                    await sleep(Math.max(retryAfter, backoff));
                     attempt++;
                     continue;
                 }
                 return res;
             } catch (err) {
                 if (attempt < retries) {
-                    await sleep(BASE_DELAY * Math.pow(2, attempt) + Math.random() * JITTER);
+                    const backoff = Math.min(
+                        MAX_RETRY_DELAY,
+                        RETRY_BASE_DELAY * Math.pow(2, attempt) + Math.random() * JITTER
+                    );
+                    await sleep(backoff);
                     attempt++;
                     continue;
                 }
@@ -379,7 +401,6 @@
     // 5. API 辅助：项目列表 / 会话 meta / 会话详情
     // ==========================================
 
-    // ✅ 修复：不再要求 workspaceId 才能请求项目
     async function getProjects(workspaceId) {
         const r = await fetchWithRetry('/backend-api/gizmos/snorlax/sidebar', {
             headers: buildHeaders(workspaceId)
@@ -404,17 +425,14 @@
      */
     async function collectConversationsMeta(workspaceId, includeProjects, rootLimit = Infinity) {
         const headers = buildHeaders(workspaceId);
-        const metaMap = new Map(); // id -> meta
+        const metaMap = new Map();
 
         const upsert = meta => {
             const existing = metaMap.get(meta.id);
             if (!existing) {
                 metaMap.set(meta.id, meta);
-            } else {
-                // project 信息优先级更高：如果 later 发现该会话在项目内，则归为 project
-                if (meta.source === 'project' && existing.source !== 'project') {
-                    metaMap.set(meta.id, { ...existing, ...meta });
-                }
+            } else if (meta.source === 'project' && existing.source !== 'project') {
+                metaMap.set(meta.id, { ...existing, ...meta });
             }
         };
 
@@ -480,22 +498,22 @@
             }
         }
 
-        // 2) 项目内会话（✅ 修复：只判断 includeProjects，不再要求 workspaceId）
+        // 2) 项目内会话：从第一页开始，兼容 cursor / next_cursor 两种响应字段。
         if (includeProjects) {
             const projects = await getProjects(workspaceId);
             for (const project of projects) {
-                let cursor = '0';
-                while (cursor) {
-                    const url = `/backend-api/gizmos/${project.id}/conversations?cursor=${cursor}`;
+                let cursor = null;
+                const seenCursors = new Set();
+
+                while (true) {
+                    const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+                    const url = `/backend-api/gizmos/${project.id}/conversations${query}`;
                     const r = await fetchWithRetry(url, { headers });
                     if (!r.ok)
                         throw new Error(`列举项目对话列表失败 (${r.status})`);
                     const j = await r.json();
                     const items = j.items || [];
-                    if (!items.length) {
-                        cursor = null;
-                        break;
-                    }
+
                     for (const it of items) {
                         if (!it || !it.id) continue;
                         const updated =
@@ -513,7 +531,12 @@
                             projectTitle: project.title
                         });
                     }
-                    cursor = j.cursor;
+
+                    const nextCursor = j.next_cursor ?? j.cursor ?? null;
+                    const hasMore = j.has_more ?? j.hasMore ?? Boolean(nextCursor);
+                    if (!hasMore || !nextCursor || seenCursors.has(String(nextCursor))) break;
+                    seenCursors.add(String(nextCursor));
+                    cursor = String(nextCursor);
                     await sleep(jitter());
                 }
             }
@@ -567,7 +590,6 @@
         const iconSpan = btn.querySelector('.btn-icon');
         const labelSpan = btn.querySelector('.btn-label');
 
-        const originalIconHTML = iconSpan ? iconSpan.innerHTML : '';
         const originalLabelText = labelSpan ? labelSpan.textContent : '';
         const resetProgress = () => btn.style.setProperty('--prog', '0%');
 
@@ -617,7 +639,6 @@
                 return;
             }
 
-            // 扫描 meta（根目录带上 rootLimit）
             setIcon('spinner');
             setLabel('扫描中...');
             setProgress(5);
@@ -636,11 +657,9 @@
                 return;
             }
 
-            // 各自排序（按更新时间降序）
             rootMeta.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
             projectMeta.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 
-            // 根目录应用“最近 N 条”限制；项目不受 N 限制（全量导出）
             const selectedRoot =
                 limit === Infinity ? rootMeta : rootMeta.slice(0, limit);
             const exportMetaList = selectedRoot.concat(projectMeta);
@@ -696,7 +715,6 @@
                 await sleep(jitter());
             }
 
-            // 打包阶段
             setIcon('spinner');
             setLabel('打包...');
             setProgress(95);
